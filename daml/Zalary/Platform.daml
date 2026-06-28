@@ -1,0 +1,94 @@
+module Zalary.Platform where
+
+import DA.Time
+import Zalary.Types
+import Zalary.Company
+
+-- Platform-level governance controlled by Zalary/builders.
+-- This contract defines the stablecoins the platform supports globally.
+-- Companies do not self-approve arbitrary payroll tokens.
+template ZalaryConfig
+  with
+    platformAdmin : Party
+    supportedStablecoins : [Text]
+    defaultStablecoin : Text
+    isActive : Bool
+    createdAt : Time
+  where
+    signatory platformAdmin
+
+    ensure
+      length supportedStablecoins > 0
+        && isUnique supportedStablecoins
+        && all nonEmptyText supportedStablecoins
+        && nonEmptyText defaultStablecoin
+        && elem defaultStablecoin supportedStablecoins
+
+    key platformAdmin : Party
+    maintainer key
+
+    choice UpdateSupportedStablecoins : ContractId ZalaryConfig
+      with
+        newSupportedStablecoins : [Text]
+        newDefaultStablecoin : Text
+      controller platformAdmin
+      do
+        assertMsg "Supported stablecoin list cannot be empty" (length newSupportedStablecoins > 0)
+        assertMsg "Supported stablecoin list cannot contain duplicates" (isUnique newSupportedStablecoins)
+        assertMsg "Supported stablecoin values cannot be empty" (all nonEmptyText newSupportedStablecoins)
+        assertMsg "Default stablecoin is required" (nonEmptyText newDefaultStablecoin)
+        assertMsg "Default stablecoin must be supported" (elem newDefaultStablecoin newSupportedStablecoins)
+        create this with
+          supportedStablecoins = newSupportedStablecoins
+          defaultStablecoin = newDefaultStablecoin
+
+    choice DeactivatePlatformConfig : ContractId ZalaryConfig
+      controller platformAdmin
+      do
+        create this with isActive = False
+
+    nonconsuming choice CreateCompany : ContractId Company
+      with
+        companyAdmin : Party
+        companyName : Text
+        companyId : Text
+        adminWallets : [Party]
+        hrWallets : [Party]
+        employerWallets : [Party]
+        allowedTokens : [Text]
+      controller platformAdmin, companyAdmin
+      do
+        assertMsg "Platform config must be active" isActive
+        assertMsg "Company allowed token list cannot be empty" (length allowedTokens > 0)
+        assertMsg "Company allowed token list cannot contain duplicates" (isUnique allowedTokens)
+        assertMsg "Company allowed token values cannot be empty" (all nonEmptyText allowedTokens)
+        assertMsg "Company allowed tokens must be globally supported" (isSubset allowedTokens supportedStablecoins)
+        now <- getTime
+        create Company with
+          platformAdmin
+          companyAdmin
+          companyName
+          companyId
+          adminWallets
+          hrWallets
+          employerWallets
+          allowedTokens
+          createdAt = now
+
+    nonconsuming choice UpdateCompanyAllowedTokens : ContractId Company
+      with
+        companyCid : ContractId Company
+        companyAdmin : Party
+        newAllowedTokens : [Text]
+      controller platformAdmin, companyAdmin
+      do
+        company <- fetch companyCid
+        assertMsg "Platform config must be active" isActive
+        assertMsg "Company platform admin mismatch" (company.platformAdmin == platformAdmin)
+        assertMsg "Company admin mismatch" (company.companyAdmin == companyAdmin)
+        assertMsg "Company allowed token list cannot be empty" (length newAllowedTokens > 0)
+        assertMsg "Company allowed token list cannot contain duplicates" (isUnique newAllowedTokens)
+        assertMsg "Company allowed token values cannot be empty" (all nonEmptyText newAllowedTokens)
+        assertMsg "Company allowed tokens must be globally supported" (isSubset newAllowedTokens supportedStablecoins)
+        archive companyCid
+        create company with allowedTokens = newAllowedTokens

@@ -1,0 +1,424 @@
+module Zalary.Tests where
+
+import Daml.Script
+import DA.Date
+import DA.Time
+import Zalary.Types
+import Zalary.Platform
+import Zalary.Company
+import Zalary.Enrollment
+import Zalary.Payroll
+
+samplePeriod : PayrollPeriod
+samplePeriod = PayrollPeriod with
+  label = "June 2026"
+  startsAt = date 2026 Jun 1
+  endsAt = date 2026 Jun 30
+
+sampleSalary : SalaryBreakdown
+sampleSalary = SalaryBreakdown with
+  grossPay = 1000.0
+  allowances = 200.0
+  deductions = 100.0
+  netPay = 1100.0
+  currency = "USDC"
+
+secondSalary : SalaryBreakdown
+secondSalary = SalaryBreakdown with
+  grossPay = 900.0
+  allowances = 100.0
+  deductions = 50.0
+  netPay = 950.0
+  currency = "USDC"
+
+setupCompany : Text -> Script (Party, Party, Party, Party, Party, ContractId ZalaryConfig, ContractId Company)
+setupCompany suffix = script do
+  platformAdmin <- allocateParty ("PlatformAdmin-" <> suffix)
+  companyAdmin <- allocateParty ("CompanyAdmin-" <> suffix)
+  employer <- allocateParty ("EmployerWallet-" <> suffix)
+  hr <- allocateParty ("HRWallet-" <> suffix)
+  employee <- allocateParty ("EmployeeWallet-" <> suffix)
+
+  now <- getTime
+
+  platformConfigCid <- submit platformAdmin do
+    createCmd ZalaryConfig with
+      platformAdmin
+      supportedStablecoins = ["USDC", "USDT"]
+      defaultStablecoin = "USDC"
+      isActive = True
+      createdAt = now
+
+  companyCid <- submitMulti [platformAdmin, companyAdmin] [] do
+    exerciseCmd platformConfigCid CreateCompany with
+      companyAdmin
+      companyName = "Zalary Demo Ltd"
+      companyId = "ZAL-" <> suffix
+      adminWallets = [companyAdmin]
+      hrWallets = [hr]
+      employerWallets = [employer]
+      allowedTokens = ["USDC"]
+
+  return (platformAdmin, companyAdmin, employer, hr, employee, platformConfigCid, companyCid)
+
+createEnrollmentFromCompany
+  : ContractId Company
+  -> Party
+  -> Party
+  -> Party
+  -> Text
+  -> Script (ContractId EmployeeEnrollment)
+createEnrollmentFromCompany companyCid hr employer employee employeeExternalId = script do
+  submit hr do
+    exerciseCmd companyCid CreateEmployeeEnrollment with
+      hrWallet = hr
+      employerWallet = employer
+      employeeWallet = employee
+      employeeExternalId
+
+createVaultFromCompany
+  : ContractId Company
+  -> Party
+  -> Party
+  -> Text
+  -> Text
+  -> Text
+  -> Int
+  -> Script (ContractId PayrollVault)
+createVaultFromCompany companyCid hr employer payrollId suffix payrollCurrency expectedEmployeeCount = script do
+  now <- getTime
+  submit hr do
+    exerciseCmd companyCid CreatePayrollVault with
+      hrWallet = hr
+      employerWallet = employer
+      payrollId
+      payrollPeriod = samplePeriod
+      payrollCurrency
+      claimWindowStart = now
+      claimWindowEnd = addRelTime now (days 7)
+      expectedEmployeeCount
+
+payrollHappyPath : Script ()
+payrollHappyPath = script do
+  (_platformAdmin, _companyAdmin, employer, hr, employee, _platformConfigCid, companyCid) <- setupCompany "HAPPY"
+
+  enrollmentCid <- createEnrollmentFromCompany companyCid hr employer employee "EMP-HAPPY-001"
+  vaultCid <- createVaultFromCompany companyCid hr employer "PAYROLL-HAPPY-2026-06" "HAPPY" "USDC" 1
+
+  (vaultWithAllocationCid, allocationCid) <- submit hr do
+    exerciseCmd vaultCid AddSalaryAllocation with
+      allocationEmployeeWallet = employee
+      employeeExternalId = "EMP-HAPPY-001"
+      salaryBreakdown = sampleSalary
+      enrollmentCid
+
+  finalizedVaultCid <- submit hr do
+    exerciseCmd vaultWithAllocationCid FinalizeAllocations
+
+  (fundedVaultCid, _fundingReceiptCid) <- submit employer do
+    exerciseCmd finalizedVaultCid ConfirmFunding with
+      stableToken = "USDC"
+      fundingAmount = 1100.0
+      fundingReference = "FUND-HAPPY-001"
+
+  activeVaultCid <- submit employer do
+    exerciseCmd fundedVaultCid ActivatePayroll
+
+  (_updatedAllocationCid, ticketCid) <- submit hr do
+    exerciseCmd allocationCid IssueClaimTicket with
+      payrollVaultCid = activeVaultCid
+
+  claimCid <- submit employee do
+    exerciseCmd ticketCid RequestSalaryClaim
+
+  (_settledVaultCid, _settledAllocationCid, _settlementReceiptCid, _payslipCid, _settledRecordCid) <- submit employer do
+    exerciseCmd claimCid ConfirmSalarySettlement with
+      payrollVaultCid = activeVaultCid
+      settlementReference = "SETTLE-HAPPY-001"
+
+  return ()
+
+testNormalPayrollHappyPathStillWorks : Script ()
+testNormalPayrollHappyPathStillWorks = payrollHappyPath
+
+testPlatformConfigDeactivation : Script ()
+testPlatformConfigDeactivation = script do
+  (platformAdmin, companyAdmin, _employer, _hr, _employee, platformConfigCid, companyCid) <- setupCompany "CONFIG-DEACTIVATE"
+
+  inactiveConfigCid <- submit platformAdmin do
+    exerciseCmd platformConfigCid DeactivatePlatformConfig
+
+  submitMultiMustFail [platformAdmin, companyAdmin] [] do
+    exerciseCmd inactiveConfigCid UpdateCompanyAllowedTokens with
+      companyCid
+      companyAdmin
+      newAllowedTokens = ["USDC", "USDT"]
+
+  return ()
+
+testRejectUnsupportedTokenThroughPlatformConfig : Script ()
+testRejectUnsupportedTokenThroughPlatformConfig = script do
+  platformAdmin <- allocateParty "PlatformAdmin-UNSUPPORTED-CONFIG"
+  companyAdmin <- allocateParty "CompanyAdmin-UNSUPPORTED-CONFIG"
+  employer <- allocateParty "EmployerWallet-UNSUPPORTED-CONFIG"
+  hr <- allocateParty "HRWallet-UNSUPPORTED-CONFIG"
+
+  now <- getTime
+
+  platformConfigCid <- submit platformAdmin do
+    createCmd ZalaryConfig with
+      platformAdmin
+      supportedStablecoins = ["USDC"]
+      defaultStablecoin = "USDC"
+      isActive = True
+      createdAt = now
+
+  submitMultiMustFail [platformAdmin, companyAdmin] [] do
+    exerciseCmd platformConfigCid CreateCompany with
+      companyAdmin
+      companyName = "Unsupported Token Ltd"
+      companyId = "ZAL-UNSUPPORTED-CONFIG"
+      adminWallets = [companyAdmin]
+      hrWallets = [hr]
+      employerWallets = [employer]
+      allowedTokens = ["USDC", "DAI"]
+
+  return ()
+
+testCompanyFactoryIsNonconsuming : Script ()
+testCompanyFactoryIsNonconsuming = script do
+  (_platformAdmin, _companyAdmin, employer, hr, employeeA, _platformConfigCid, companyCid) <- setupCompany "FACTORY"
+  employeeB <- allocateParty "EmployeeWallet-FACTORY-B"
+
+  _enrollmentA <- createEnrollmentFromCompany companyCid hr employer employeeA "EMP-FACTORY-A"
+  _enrollmentB <- createEnrollmentFromCompany companyCid hr employer employeeB "EMP-FACTORY-B"
+
+  _vaultCid <- createVaultFromCompany companyCid hr employer "PAYROLL-FACTORY-2026-06" "FACTORY" "USDC" 2
+  return ()
+
+testRejectUnapprovedHRFactoryUse : Script ()
+testRejectUnapprovedHRFactoryUse = script do
+  (_platformAdmin, _companyAdmin, employer, _hr, employee, _platformConfigCid, companyCid) <- setupCompany "BADHR"
+  fakeHr <- allocateParty "FakeHR-BADHR"
+
+  submitMustFail fakeHr do
+    exerciseCmd companyCid CreateEmployeeEnrollment with
+      hrWallet = fakeHr
+      employerWallet = employer
+      employeeWallet = employee
+      employeeExternalId = "EMP-BADHR-001"
+
+  return ()
+
+testRejectWrongEnrollment : Script ()
+testRejectWrongEnrollment = script do
+  (_platformAdmin, _companyAdmin, employer, hr, employee, _platformConfigCid, companyCid) <- setupCompany "WRONG-ENROLL"
+  wrongEmployee <- allocateParty "WrongEmployee-WRONG-ENROLL"
+
+  wrongEnrollmentCid <- createEnrollmentFromCompany companyCid hr employer wrongEmployee "EMP-WRONG"
+  vaultCid <- createVaultFromCompany companyCid hr employer "PAYROLL-WRONG-ENROLLMENT" "WRONG-ENROLL" "USDC" 1
+
+  submitMustFail hr do
+    exerciseCmd vaultCid AddSalaryAllocation with
+      allocationEmployeeWallet = employee
+      employeeExternalId = "EMP-WRONG"
+      salaryBreakdown = sampleSalary
+      enrollmentCid = wrongEnrollmentCid
+
+  return ()
+
+testRejectFundingBeforeFinalization : Script ()
+testRejectFundingBeforeFinalization = script do
+  (_platformAdmin, _companyAdmin, employer, hr, _employee, _platformConfigCid, companyCid) <- setupCompany "FUND-BEFORE-FINAL"
+  vaultCid <- createVaultFromCompany companyCid hr employer "PAYROLL-NOT-FINALIZED" "FUND-BEFORE-FINAL" "USDC" 1
+
+  submitMustFail employer do
+    exerciseCmd vaultCid ConfirmFunding with
+      stableToken = "USDC"
+      fundingAmount = 1100.0
+      fundingReference = "FUND-SHOULD-FAIL"
+
+  return ()
+
+testRejectEarlyLeftoverWithdrawal : Script ()
+testRejectEarlyLeftoverWithdrawal = script do
+  (_platformAdmin, _companyAdmin, employer, hr, employee, _platformConfigCid, companyCid) <- setupCompany "LEFTOVER"
+
+  enrollmentCid <- createEnrollmentFromCompany companyCid hr employer employee "EMP-LEFTOVER"
+  vaultCid <- createVaultFromCompany companyCid hr employer "PAYROLL-LEFTOVER" "LEFTOVER" "USDC" 1
+
+  (vaultWithAllocationCid, _allocationCid) <- submit hr do
+    exerciseCmd vaultCid AddSalaryAllocation with
+      allocationEmployeeWallet = employee
+      employeeExternalId = "EMP-LEFTOVER"
+      salaryBreakdown = sampleSalary
+      enrollmentCid
+
+  finalizedVaultCid <- submit hr do
+    exerciseCmd vaultWithAllocationCid FinalizeAllocations
+
+  (fundedVaultCid, _fundingReceiptCid) <- submit employer do
+    exerciseCmd finalizedVaultCid ConfirmFunding with
+      stableToken = "USDC"
+      fundingAmount = 1200.0
+      fundingReference = "FUND-LEFTOVER"
+
+  activeVaultCid <- submit employer do
+    exerciseCmd fundedVaultCid ActivatePayroll
+
+  submitMustFail employer do
+    exerciseCmd activeVaultCid WithdrawLeftovers with
+      withdrawalReference = "EARLY-WITHDRAWAL-SHOULD-FAIL"
+
+  return ()
+
+testRejectDuplicateAllocation : Script ()
+testRejectDuplicateAllocation = script do
+  (_platformAdmin, _companyAdmin, employer, hr, employee, _platformConfigCid, companyCid) <- setupCompany "DUPLICATE"
+
+  enrollmentCid <- createEnrollmentFromCompany companyCid hr employer employee "EMP-DUPLICATE"
+  vaultCid <- createVaultFromCompany companyCid hr employer "PAYROLL-DUPLICATE" "DUPLICATE" "USDC" 2
+
+  (vaultWithAllocationCid, _allocationCid) <- submit hr do
+    exerciseCmd vaultCid AddSalaryAllocation with
+      allocationEmployeeWallet = employee
+      employeeExternalId = "EMP-DUPLICATE"
+      salaryBreakdown = sampleSalary
+      enrollmentCid
+
+  submitMustFail hr do
+    exerciseCmd vaultWithAllocationCid AddSalaryAllocation with
+      allocationEmployeeWallet = employee
+      employeeExternalId = "EMP-DUPLICATE-2"
+      salaryBreakdown = secondSalary
+      enrollmentCid
+
+  return ()
+
+testRejectTokenNotAllowedForCompany : Script ()
+testRejectTokenNotAllowedForCompany = script do
+  (_platformAdmin, _companyAdmin, employer, hr, _employee, _platformConfigCid, companyCid) <- setupCompany "TOKEN-BLOCK"
+
+  submitMustFail hr do
+    exerciseCmd companyCid CreatePayrollVault with
+      hrWallet = hr
+      employerWallet = employer
+      payrollId = "PAYROLL-UNSUPPORTED-USDT"
+      payrollPeriod = samplePeriod
+      payrollCurrency = "USDT"
+      claimWindowStart = time (date 2026 Jun 1) 0 0 0
+      claimWindowEnd = time (date 2026 Jun 8) 0 0 0
+      expectedEmployeeCount = 1
+
+  return ()
+
+testPlatformCanAssignSecondStablecoin : Script ()
+testPlatformCanAssignSecondStablecoin = script do
+  (platformAdmin, companyAdmin, employer, hr, _employee, platformConfigCid, companyCid) <- setupCompany "TOKEN-ALLOW"
+
+  updatedCompanyCid <- submitMulti [platformAdmin, companyAdmin] [] do
+    exerciseCmd platformConfigCid UpdateCompanyAllowedTokens with
+      companyCid
+      companyAdmin
+      newAllowedTokens = ["USDC", "USDT"]
+
+  _vaultCid <- createVaultFromCompany updatedCompanyCid hr employer "PAYROLL-USDT-ALLOWED" "TOKEN-ALLOW" "USDT" 1
+  return ()
+
+testRejectClaimTicketAfterWindowEnd : Script ()
+testRejectClaimTicketAfterWindowEnd = script do
+  (_platformAdmin, _companyAdmin, employer, hr, employee, _platformConfigCid, companyCid) <- setupCompany "LATE-TICKET"
+
+  enrollmentCid <- createEnrollmentFromCompany companyCid hr employer employee "EMP-LATE-TICKET"
+  now <- getTime
+
+  vaultCid <- submit hr do
+    exerciseCmd companyCid CreatePayrollVault with
+      hrWallet = hr
+      employerWallet = employer
+      payrollId = "PAYROLL-LATE-TICKET"
+      payrollPeriod = samplePeriod
+      payrollCurrency = "USDC"
+      claimWindowStart = now
+      claimWindowEnd = addRelTime now (days 1)
+      expectedEmployeeCount = 1
+
+  (vaultWithAllocationCid, allocationCid) <- submit hr do
+    exerciseCmd vaultCid AddSalaryAllocation with
+      allocationEmployeeWallet = employee
+      employeeExternalId = "EMP-LATE-TICKET"
+      salaryBreakdown = sampleSalary
+      enrollmentCid
+
+  finalizedVaultCid <- submit hr do
+    exerciseCmd vaultWithAllocationCid FinalizeAllocations
+
+  (fundedVaultCid, _fundingReceiptCid) <- submit employer do
+    exerciseCmd finalizedVaultCid ConfirmFunding with
+      stableToken = "USDC"
+      fundingAmount = 1100.0
+      fundingReference = "FUND-LATE-TICKET"
+
+  activeVaultCid <- submit employer do
+    exerciseCmd fundedVaultCid ActivatePayroll
+
+  _ <- passTime (days 2)
+
+  submitMustFail hr do
+    exerciseCmd allocationCid IssueClaimTicket with
+      payrollVaultCid = activeVaultCid
+
+  return ()
+
+testDirectSettlementHelperRequiresValidAllocation : Script ()
+testDirectSettlementHelperRequiresValidAllocation = script do
+  (_platformAdmin, companyAdmin, employer, hr, employee, _platformConfigCid, companyCid) <- setupCompany "DIRECT-SETTLEMENT"
+
+  enrollmentCid <- createEnrollmentFromCompany companyCid hr employer employee "EMP-DIRECT-SETTLEMENT"
+  vaultCid <- createVaultFromCompany companyCid hr employer "PAYROLL-DIRECT-SETTLEMENT" "DIRECT-SETTLEMENT" "USDC" 1
+
+  (vaultWithAllocationCid, allocationCid) <- submit hr do
+    exerciseCmd vaultCid AddSalaryAllocation with
+      allocationEmployeeWallet = employee
+      employeeExternalId = "EMP-DIRECT-SETTLEMENT"
+      salaryBreakdown = sampleSalary
+      enrollmentCid
+
+  finalizedVaultCid <- submit hr do
+    exerciseCmd vaultWithAllocationCid FinalizeAllocations
+
+  (fundedVaultCid, _fundingReceiptCid) <- submit employer do
+    exerciseCmd finalizedVaultCid ConfirmFunding with
+      stableToken = "USDC"
+      fundingAmount = 1100.0
+      fundingReference = "FUND-DIRECT-SETTLEMENT"
+
+  activeVaultCid <- submit employer do
+    exerciseCmd fundedVaultCid ActivatePayroll
+
+  now <- getTime
+
+  settlementAuthCid <- submitMulti [employee, employer] [] do
+    createCmd ClaimActionAuthorization with
+      authHrWallet = hr
+      authEmployerWallet = employer
+      authEmployeeWallet = employee
+      authCompanyId = "ZAL-DIRECT-SETTLEMENT"
+      authPayrollId = "PAYROLL-DIRECT-SETTLEMENT"
+      authPeriod = samplePeriod
+      authCurrency = "USDC"
+      authEmployeeExternalId = "EMP-DIRECT-SETTLEMENT"
+      authAmount = 1100.0
+      authSourceAllocationCid = allocationCid
+      authAction = SettlementAction
+      companyAdmin
+      authorizedAt = now
+
+  submitMustFail employer do
+    exerciseCmd activeVaultCid RecordSettlement with
+      settlementEmployeeWallet = employee
+      settlementEmployeeExternalId = "EMP-DIRECT-SETTLEMENT"
+      settlementAmount = 1100.0
+      settlementAuthCid
+
+  return ()

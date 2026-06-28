@@ -1,0 +1,182 @@
+module Zalary.Audit where
+
+import DA.Time
+import Zalary.Types
+
+template FundingReceipt
+  with
+    fundingEmployerWallet : Party
+    fundingHrWallet : Party
+    fundingCompanyId : Text
+    fundingPayrollId : Text
+    fundingPeriod : PayrollPeriod
+    fundingCurrency : Text
+    fundingAmount : Decimal
+    fundingReference : Text
+    companyAdmin : Party
+    fundedAt : Time
+  where
+    signatory fundingEmployerWallet
+    observer fundingHrWallet, companyAdmin
+    ensure
+      fundingAmount > 0.0
+        && nonEmptyText fundingCompanyId
+        && nonEmptyText fundingPayrollId
+        && nonEmptyText fundingCurrency
+        && nonEmptyText fundingReference
+        && validPayrollPeriod fundingPeriod
+
+template PayrollCancellationReceipt
+  with
+    cancellationActor : Party
+    cancellationHrWallet : Party
+    cancellationEmployerWallet : Party
+    cancellationCompanyId : Text
+    cancellationPayrollId : Text
+    cancellationPeriod : PayrollPeriod
+    cancellationReason : Text
+    companyAdmin : Party
+    cancelledAt : Time
+  where
+    signatory cancellationActor
+    observer cancellationHrWallet, cancellationEmployerWallet, companyAdmin
+    ensure
+      nonEmptyText cancellationCompanyId
+        && nonEmptyText cancellationPayrollId
+        && nonEmptyText cancellationReason
+        && validPayrollPeriod cancellationPeriod
+
+template LeftoverWithdrawalReceipt
+  with
+    leftoverEmployerWallet : Party
+    leftoverHrWallet : Party
+    leftoverCompanyId : Text
+    leftoverPayrollId : Text
+    leftoverPeriod : PayrollPeriod
+    leftoverCurrency : Text
+    leftoverAmount : Decimal
+    withdrawalReference : Text
+    companyAdmin : Party
+    withdrawnAt : Time
+  where
+    signatory leftoverEmployerWallet
+    observer leftoverHrWallet, companyAdmin
+    ensure
+      leftoverAmount > 0.0
+        && nonEmptyText leftoverCompanyId
+        && nonEmptyText leftoverPayrollId
+        && nonEmptyText leftoverCurrency
+        && nonEmptyText withdrawalReference
+        && validPayrollPeriod leftoverPeriod
+
+template SettlementReceipt
+  with
+    receiptEmployerWallet : Party
+    receiptHrWallet : Party
+    receiptEmployeeWallet : Party
+    receiptCompanyId : Text
+    receiptPayrollId : Text
+    receiptPeriod : PayrollPeriod
+    receiptCurrency : Text
+    receiptEmployeeExternalId : Text
+    receiptSalaryBreakdown : SalaryBreakdown
+    receiptAmount : Decimal
+    settlementReference : Text
+    companyAdmin : Party
+    settledAt : Time
+  where
+    signatory receiptEmployerWallet
+    observer receiptHrWallet, receiptEmployeeWallet, companyAdmin
+    ensure
+      receiptAmount > 0.0
+        && nonEmptyText receiptCompanyId
+        && nonEmptyText receiptPayrollId
+        && nonEmptyText receiptCurrency
+        && nonEmptyText receiptEmployeeExternalId
+        && nonEmptyText settlementReference
+        && validPayrollPeriod receiptPeriod
+        && validSalaryBreakdown receiptSalaryBreakdown
+        && receiptSalaryBreakdown.currency == receiptCurrency
+        && receiptSalaryBreakdown.netPay == receiptAmount
+
+template Payslip
+  with
+    payslipEmployerWallet : Party
+    payslipHrWallet : Party
+    payslipEmployeeWallet : Party
+    payslipCompanyId : Text
+    payslipPayrollId : Text
+    payslipPeriod : PayrollPeriod
+    payslipCurrency : Text
+    payslipEmployeeExternalId : Text
+    payslipSalaryBreakdown : SalaryBreakdown
+    companyAdmin : Party
+    issuedAt : Time
+  where
+    signatory payslipEmployerWallet
+    observer payslipHrWallet, payslipEmployeeWallet, companyAdmin
+    ensure
+      nonEmptyText payslipCompanyId
+        && nonEmptyText payslipPayrollId
+        && nonEmptyText payslipCurrency
+        && nonEmptyText payslipEmployeeExternalId
+        && validPayrollPeriod payslipPeriod
+        && validSalaryBreakdown payslipSalaryBreakdown
+        && payslipSalaryBreakdown.currency == payslipCurrency
+
+template SettledSalaryRecord
+  with
+    settledRecordEmployerWallet : Party
+    settledRecordHrWallet : Party
+    settledRecordEmployeeWallet : Party
+    settledRecordCompanyId : Text
+    settledRecordPayrollId : Text
+    settledRecordPeriod : PayrollPeriod
+    settledRecordCurrency : Text
+    settledRecordEmployeeExternalId : Text
+    settledRecordAmount : Decimal
+    settledRecordReference : Text
+    companyAdmin : Party
+    settledRecordAt : Time
+  where
+    signatory settledRecordEmployerWallet
+    observer settledRecordHrWallet, settledRecordEmployeeWallet, companyAdmin
+    ensure
+      settledRecordAmount > 0.0
+        && nonEmptyText settledRecordCompanyId
+        && nonEmptyText settledRecordPayrollId
+        && nonEmptyText settledRecordCurrency
+        && nonEmptyText settledRecordEmployeeExternalId
+        && nonEmptyText settledRecordReference
+        && validPayrollPeriod settledRecordPeriod
+
+template FailedSalaryClaim
+  with
+    failedEmployerWallet : Party
+    failedHrWallet : Party
+    failedEmployeeWallet : Party
+    failedCompanyId : Text
+    failedPayrollId : Text
+    failedPeriod : PayrollPeriod
+    failedCurrency : Text
+    failedEmployeeExternalId : Text
+    failedSalaryBreakdown : SalaryBreakdown
+    failedAmount : Decimal
+    failureReason : Text
+    companyAdmin : Party
+    failedAt : Time
+  where
+    signatory failedEmployerWallet
+    observer failedHrWallet, failedEmployeeWallet, companyAdmin
+    ensure
+      failedAmount > 0.0
+        && nonEmptyText failedCompanyId
+        && nonEmptyText failedPayrollId
+        && nonEmptyText failedCurrency
+        && nonEmptyText failedEmployeeExternalId
+        && nonEmptyText failureReason
+        && validPayrollPeriod failedPeriod
+        && validSalaryBreakdown failedSalaryBreakdown
+        && failedSalaryBreakdown.currency == failedCurrency
+        && failedSalaryBreakdown.netPay == failedAmount
+

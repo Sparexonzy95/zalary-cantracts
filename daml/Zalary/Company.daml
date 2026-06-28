@@ -1,0 +1,144 @@
+module Zalary.Company where
+
+import DA.Time
+import Zalary.Types
+import Zalary.Enrollment
+import Zalary.Payroll
+
+-- Company registry and role authority.
+-- Platform admin governs token policy and company onboarding.
+-- Company admin governs company-side role permissions.
+-- HR creates payroll/enrollment through this registry, but companyAdmin does not
+-- manually sign every payroll action.
+template Company
+  with
+    platformAdmin : Party
+    companyAdmin : Party
+    companyName : Text
+    companyId : Text
+    adminWallets : [Party]
+    hrWallets : [Party]
+    employerWallets : [Party]
+    allowedTokens : [Text]
+    createdAt : Time
+  where
+    signatory platformAdmin, companyAdmin
+    observer adminWallets, hrWallets, employerWallets
+
+    ensure
+      nonEmptyText companyName
+        && nonEmptyText companyId
+        && elem companyAdmin adminWallets
+        && isUnique adminWallets
+        && isUnique hrWallets
+        && isUnique employerWallets
+        && isUnique allowedTokens
+        && length allowedTokens > 0
+        && all nonEmptyText allowedTokens
+
+    key (platformAdmin, companyId) : (Party, Text)
+    maintainer key._1
+
+    choice AddHR : ContractId Company
+      with
+        actingAdmin : Party
+        hrWallet : Party
+      controller actingAdmin
+      do
+        assertMsg "Only an admin can add HR" (elem actingAdmin adminWallets)
+        assertMsg "HR wallet already added" (not (elem hrWallet hrWallets))
+        create this with hrWallets = hrWallet :: hrWallets
+
+    choice RemoveHR : ContractId Company
+      with
+        actingAdmin : Party
+        hrWallet : Party
+      controller actingAdmin
+      do
+        assertMsg "Only an admin can remove HR" (elem actingAdmin adminWallets)
+        assertMsg "HR wallet not found" (elem hrWallet hrWallets)
+        create this with hrWallets = filter (\p -> p /= hrWallet) hrWallets
+
+    choice AddEmployerWallet : ContractId Company
+      with
+        actingAdmin : Party
+        employerWallet : Party
+      controller actingAdmin
+      do
+        assertMsg "Only an admin can add employer/funding wallet" (elem actingAdmin adminWallets)
+        assertMsg "Employer wallet already added" (not (elem employerWallet employerWallets))
+        create this with employerWallets = employerWallet :: employerWallets
+
+    choice RemoveEmployerWallet : ContractId Company
+      with
+        actingAdmin : Party
+        employerWallet : Party
+      controller actingAdmin
+      do
+        assertMsg "Only an admin can remove employer/funding wallet" (elem actingAdmin adminWallets)
+        assertMsg "Employer wallet not found" (elem employerWallet employerWallets)
+        create this with employerWallets = filter (\p -> p /= employerWallet) employerWallets
+
+    nonconsuming choice CreateEmployeeEnrollment : ContractId EmployeeEnrollment
+      with
+        hrWallet : Party
+        employerWallet : Party
+        employeeWallet : Party
+        employeeExternalId : Text
+      controller hrWallet
+      do
+        assertMsg "HR wallet is not approved for this company" (elem hrWallet hrWallets)
+        assertMsg "Employer wallet is not approved for this company" (elem employerWallet employerWallets)
+        assertMsg "Employee external ID is required" (nonEmptyText employeeExternalId)
+        now <- getTime
+        create EmployeeEnrollment with
+          hrWallet
+          employerWallet
+          employeeWallet
+          employeeExternalId
+          walletAssigned = True
+          isActive = True
+          companyAdmin = this.companyAdmin
+          companyId
+          enrolledAt = now
+
+    nonconsuming choice CreatePayrollVault : ContractId PayrollVault
+      with
+        hrWallet : Party
+        employerWallet : Party
+        payrollId : Text
+        payrollPeriod : PayrollPeriod
+        payrollCurrency : Text
+        claimWindowStart : Time
+        claimWindowEnd : Time
+        expectedEmployeeCount : Int
+      controller hrWallet
+      do
+        assertMsg "HR wallet is not approved for this company" (elem hrWallet hrWallets)
+        assertMsg "Employer wallet is not approved for this company" (elem employerWallet employerWallets)
+        assertMsg "Payroll token is not allowed for this company" (elem payrollCurrency allowedTokens)
+        assertMsg "Payroll ID is required" (nonEmptyText payrollId)
+        assertMsg "Payroll period is invalid" (validPayrollPeriod payrollPeriod)
+        assertMsg "Claim window is invalid" (claimWindowStart < claimWindowEnd)
+        assertMsg "Expected employee count must be positive" (expectedEmployeeCount > 0)
+        now <- getTime
+        create PayrollVault with
+          hrWallet
+          employerWallet
+          companyAdmin = this.companyAdmin
+          companyId
+          payrollId
+          payrollPeriod
+          payrollCurrency
+          claimWindowStart
+          claimWindowEnd
+          expectedEmployeeCount
+          uploadedAllocationCount = 0
+          allocatedEmployees = []
+          allocatedEmployeeExternalIds = []
+          totalNetPay = 0.0
+          fundedAmount = 0.0
+          settledAmount = 0.0
+          withdrawnAmount = 0.0
+          vaultStatus = Created
+          createdAt = now

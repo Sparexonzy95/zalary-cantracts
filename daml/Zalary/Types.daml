@@ -1,0 +1,80 @@
+module Zalary.Types where
+
+import DA.Date
+
+-- Strict payroll lifecycle:
+-- Created -> AllocationsFinalized -> Funded -> Active -> Closed
+-- Created/AllocationsFinalized -> CancelledByHR
+-- Funded -> CancelledAfterFunding
+-- Leftover withdrawal is only allowed after Closed or CancelledAfterFunding.
+data PayrollStatus
+  = Created
+  | AllocationsFinalized
+  | Funded
+  | Active
+  | Closed
+  | CancelledByHR
+  | CancelledAfterFunding
+  deriving (Eq, Show)
+
+data AllocationStatus
+  = AllocationCreated
+  | AllocationClaimTicketIssued
+  | AllocationSettled
+  | AllocationClaimRejected
+  | AllocationCancelled
+  deriving (Eq, Show)
+
+data ClaimStatus
+  = ClaimRequested
+  | ClaimSettled
+  | ClaimFailed
+  | ClaimCancelled
+  deriving (Eq, Show)
+
+data ClaimAction
+  = SettlementAction
+  | RejectionAction
+  deriving (Eq, Show)
+
+data PayrollPeriod = PayrollPeriod
+  with
+    label : Text
+    startsAt : Date
+    endsAt : Date
+  deriving (Eq, Show)
+
+data SalaryBreakdown = SalaryBreakdown
+  with
+    grossPay : Decimal
+    allowances : Decimal
+    deductions : Decimal
+    netPay : Decimal
+    currency : Text
+  deriving (Eq, Show)
+
+nonEmptyText : Text -> Bool
+nonEmptyText value = value /= ""
+
+isUnique : Eq a => [a] -> Bool
+isUnique values =
+  case values of
+    [] -> True
+    x :: xs -> not (elem x xs) && isUnique xs
+
+isSubset : Eq a => [a] -> [a] -> Bool
+isSubset values allowedValues =
+  all (\value -> elem value allowedValues) values
+
+validPayrollPeriod : PayrollPeriod -> Bool
+validPayrollPeriod period =
+  nonEmptyText period.label && period.startsAt <= period.endsAt
+
+validSalaryBreakdown : SalaryBreakdown -> Bool
+validSalaryBreakdown salary =
+  salary.grossPay >= 0.0
+    && salary.allowances >= 0.0
+    && salary.deductions >= 0.0
+    && salary.netPay > 0.0
+    && nonEmptyText salary.currency
+    && salary.netPay == salary.grossPay + salary.allowances - salary.deductions

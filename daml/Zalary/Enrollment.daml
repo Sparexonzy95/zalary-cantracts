@@ -1,0 +1,41 @@
+module Zalary.Enrollment where
+
+import DA.Time
+import Zalary.Types
+
+-- HR creates active enrollment directly.
+-- Employee does not manually accept enrollment.
+-- Employee remains an observer and later proves control by requesting salary claim.
+template EmployeeEnrollment
+  with
+    hrWallet : Party
+    employerWallet : Party
+    employeeWallet : Party
+    employeeExternalId : Text
+    walletAssigned : Bool
+    isActive : Bool
+    companyAdmin : Party
+    companyId : Text
+    enrolledAt : Time
+  where
+    signatory hrWallet, companyAdmin
+    observer employeeWallet, employerWallet
+
+    ensure
+      walletAssigned
+        && nonEmptyText employeeExternalId
+        && nonEmptyText companyId
+
+    key (companyAdmin, companyId, employeeExternalId) : (Party, Text, Text)
+    maintainer key._1
+
+    choice DeactivateEnrollmentByHR : ContractId EmployeeEnrollment
+      with
+        reason : Text
+      controller hrWallet
+      do
+        assertMsg "Deactivation reason is required" (nonEmptyText reason)
+        assertMsg "Enrollment is already inactive" isActive
+        create this with isActive = False
+
+

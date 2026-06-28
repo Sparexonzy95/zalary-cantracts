@@ -1,0 +1,20 @@
+sdk-version: 3.5.1
+name: zalary-contracts
+version: 0.3.0
+source: daml
+init-script: Zalary.Tests:payrollHappyPath
+parties:
+  - PlatformAdmin
+  - CompanyAdmin
+  - HRWallet
+  - EmployerWallet
+  - EmployeeWallet
+  - SecondEmployeeWallet
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+
+build-options:
+  - --target=2.3
+

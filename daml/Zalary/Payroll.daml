@@ -1,0 +1,746 @@
+module Zalary.Payroll where
+
+import DA.Time
+import Zalary.Types
+import Zalary.Enrollment
+import Zalary.Audit
+
+-- Core payroll workflow using final role model:
+-- HR prepares payroll; employer/funding wallet controls funds; employee claims.
+--
+-- Important hardening note:
+-- RecordSettlement, MarkSettled, and MarkRejected are helper choices that could
+-- otherwise be called directly by the employer wallet. They now require a
+-- ClaimActionAuthorization contract signed by both the employee wallet and
+-- employer wallet. SalaryClaim creates those authorization contracts inside
+-- ConfirmSalarySettlement / RejectSalaryClaim and consumes them immediately.
+
+template ClaimActionAuthorization
+  with
+    authHrWallet : Party
+    authEmployerWallet : Party
+    authEmployeeWallet : Party
+    authCompanyId : Text
+    authPayrollId : Text
+    authPeriod : PayrollPeriod
+    authCurrency : Text
+    authEmployeeExternalId : Text
+    authAmount : Decimal
+    authSourceAllocationCid : ContractId SalaryAllocation
+    authAction : ClaimAction
+    companyAdmin : Party
+    authorizedAt : Time
+  where
+    signatory authEmployeeWallet, authEmployerWallet
+    observer authHrWallet, this.companyAdmin
+
+    ensure
+      authAmount > 0.0
+        && nonEmptyText authCompanyId
+        && nonEmptyText authPayrollId
+        && nonEmptyText authCurrency
+        && nonEmptyText authEmployeeExternalId
+        && validPayrollPeriod authPeriod
+
+    choice ConsumeClaimActionAuthorization : ClaimActionAuthorization
+      controller authEmployerWallet
+      do
+        return this
+
+template PayrollVault
+  with
+    hrWallet : Party
+    employerWallet : Party
+    companyAdmin : Party
+    companyId : Text
+    payrollId : Text
+    payrollPeriod : PayrollPeriod
+    payrollCurrency : Text
+    claimWindowStart : Time
+    claimWindowEnd : Time
+    expectedEmployeeCount : Int
+    uploadedAllocationCount : Int
+    allocatedEmployees : [Party]
+    allocatedEmployeeExternalIds : [Text]
+    totalNetPay : Decimal
+    fundedAmount : Decimal
+    settledAmount : Decimal
+    withdrawnAmount : Decimal
+    vaultStatus : PayrollStatus
+    createdAt : Time
+  where
+    signatory hrWallet, this.companyAdmin
+    observer employerWallet
+
+    ensure
+      nonEmptyText companyId
+        && nonEmptyText payrollId
+        && nonEmptyText payrollCurrency
+        && validPayrollPeriod payrollPeriod
+        && claimWindowStart < claimWindowEnd
+        && expectedEmployeeCount > 0
+        && uploadedAllocationCount >= 0
+        && uploadedAllocationCount <= expectedEmployeeCount
+        && length allocatedEmployees == uploadedAllocationCount
+        && length allocatedEmployeeExternalIds == uploadedAllocationCount
+        && isUnique allocatedEmployees
+        && isUnique allocatedEmployeeExternalIds
+        && totalNetPay >= 0.0
+        && fundedAmount >= 0.0
+        && settledAmount >= 0.0
+        && withdrawnAmount >= 0.0
+        && settledAmount + withdrawnAmount <= fundedAmount
+
+    key (this.companyAdmin, companyId, payrollId) : (Party, Text, Text)
+    maintainer key._1
+
+    choice AddSalaryAllocation : (ContractId PayrollVault, ContractId SalaryAllocation)
+      with
+        allocationEmployeeWallet : Party
+        employeeExternalId : Text
+        salaryBreakdown : SalaryBreakdown
+        enrollmentCid : ContractId EmployeeEnrollment
+      controller hrWallet
+      do
+        enrollment <- fetch enrollmentCid
+        now <- getTime
+
+        assertMsg "Payroll must be in Created status" (vaultStatus == Created)
+        assertMsg "Salary breakdown is invalid" (validSalaryBreakdown salaryBreakdown)
+        assertMsg "Salary currency must match payroll currency" (salaryBreakdown.currency == payrollCurrency)
+        assertMsg "Employee already has allocation" (not (elem allocationEmployeeWallet allocatedEmployees))
+        assertMsg "Employee external ID already has allocation" (not (elem employeeExternalId allocatedEmployeeExternalIds))
+        assertMsg "Uploaded allocation count cannot exceed expected employee count" (uploadedAllocationCount < expectedEmployeeCount)
+
+        assertMsg "Enrollment HR wallet mismatch" (enrollment.hrWallet == hrWallet)
+        assertMsg "Enrollment employer wallet mismatch" (enrollment.employerWallet == employerWallet)
+        assertMsg "Enrollment employee wallet mismatch" (enrollment.employeeWallet == allocationEmployeeWallet)
+        assertMsg "Enrollment external ID mismatch" (enrollment.employeeExternalId == employeeExternalId)
+        assertMsg "Enrollment company ID mismatch" (enrollment.companyId == companyId)
+        assertMsg "Enrollment company admin mismatch" (enrollment.companyAdmin == this.companyAdmin)
+        assertMsg "Employee wallet must be assigned" enrollment.walletAssigned
+        assertMsg "Employee enrollment must be active" enrollment.isActive
+
+        allocationCid <- create SalaryAllocation with
+          allocationHrWallet = hrWallet
+          allocationEmployerWallet = employerWallet
+          allocationEmployeeWallet
+          allocationCompanyId = companyId
+          allocationPayrollId = payrollId
+          allocationPeriod = payrollPeriod
+          allocationCurrency = payrollCurrency
+          employeeExternalId
+          salaryBreakdown
+          allocationStatus = AllocationCreated
+          allocationCreatedAt = now
+          companyAdmin = this.companyAdmin
+        updatedVaultCid <- create this with
+          uploadedAllocationCount = uploadedAllocationCount + 1
+          allocatedEmployees = allocationEmployeeWallet :: allocatedEmployees
+          allocatedEmployeeExternalIds = employeeExternalId :: allocatedEmployeeExternalIds
+          totalNetPay = totalNetPay + salaryBreakdown.netPay
+
+        return (updatedVaultCid, allocationCid)
+
+    choice FinalizeAllocations : ContractId PayrollVault
+      controller hrWallet
+      do
+        assertMsg "Payroll must be in Created status" (vaultStatus == Created)
+        assertMsg "All expected allocations must be uploaded" (uploadedAllocationCount == expectedEmployeeCount)
+        assertMsg "Total net pay must be greater than zero" (totalNetPay > 0.0)
+        create this with vaultStatus = AllocationsFinalized
+
+    choice ConfirmFunding : (ContractId PayrollVault, ContractId FundingReceipt)
+      with
+        stableToken : Text
+        fundingAmount : Decimal
+        fundingReference : Text
+      controller employerWallet
+      do
+        assertMsg "Payroll must be finalized before funding" (vaultStatus == AllocationsFinalized)
+        assertMsg "Funding reference is required" (nonEmptyText fundingReference)
+        assertMsg "Funding token must match payroll currency" (stableToken == payrollCurrency)
+        assertMsg "Funding amount must be positive" (fundingAmount > 0.0)
+        assertMsg "Funding amount must cover total net pay" (fundingAmount >= totalNetPay)
+
+        now <- getTime
+        fundingReceiptCid <- create FundingReceipt with
+          fundingEmployerWallet = employerWallet
+          fundingHrWallet = hrWallet
+          fundingCompanyId = companyId
+          fundingPayrollId = payrollId
+          fundingPeriod = payrollPeriod
+          fundingCurrency = stableToken
+          fundingAmount
+          fundingReference
+          companyAdmin = this.companyAdmin
+          fundedAt = now
+
+        updatedVaultCid <- create this with
+          fundedAmount = fundingAmount
+          vaultStatus = Funded
+
+        return (updatedVaultCid, fundingReceiptCid)
+
+    choice ActivatePayroll : ContractId PayrollVault
+      controller employerWallet
+      do
+        now <- getTime
+        assertMsg "Payroll must be funded" (vaultStatus == Funded)
+        assertMsg "Cannot activate payroll after claim window has ended" (now <= claimWindowEnd)
+        create this with vaultStatus = Active
+
+    choice RecordSettlement : ContractId PayrollVault
+      with
+        settlementEmployeeWallet : Party
+        settlementEmployeeExternalId : Text
+        settlementAmount : Decimal
+        settlementAuthCid : ContractId ClaimActionAuthorization
+      controller employerWallet
+      do
+        auth <- exercise settlementAuthCid ConsumeClaimActionAuthorization
+        sourceAllocation <- fetch auth.authSourceAllocationCid
+
+        assertMsg "Payroll must be active or closed before settlement" (vaultStatus == Active || vaultStatus == Closed)
+        assertMsg "Settlement amount must be positive" (settlementAmount > 0.0)
+        assertMsg "Settlement cannot exceed remaining funded amount" (settledAmount + withdrawnAmount + settlementAmount <= fundedAmount)
+        assertMsg "Settlement authorization action mismatch" (auth.authAction == SettlementAction)
+        assertMsg "Settlement authorization HR wallet mismatch" (auth.authHrWallet == hrWallet)
+        assertMsg "Settlement authorization employer wallet mismatch" (auth.authEmployerWallet == employerWallet)
+        assertMsg "Settlement authorization employee wallet mismatch" (auth.authEmployeeWallet == settlementEmployeeWallet)
+        assertMsg "Settlement authorization employee external ID mismatch" (auth.authEmployeeExternalId == settlementEmployeeExternalId)
+        assertMsg "Settlement authorization company ID mismatch" (auth.authCompanyId == companyId)
+        assertMsg "Settlement authorization payroll ID mismatch" (auth.authPayrollId == payrollId)
+        assertMsg "Settlement authorization period mismatch" (auth.authPeriod == payrollPeriod)
+        assertMsg "Settlement authorization currency mismatch" (auth.authCurrency == payrollCurrency)
+        assertMsg "Settlement authorization amount mismatch" (auth.authAmount == settlementAmount)
+        assertMsg "Settlement authorization company admin mismatch" (auth.companyAdmin == this.companyAdmin)
+        assertMsg "Source allocation must be ticket-issued" (sourceAllocation.allocationStatus == AllocationClaimTicketIssued)
+        assertMsg "Source allocation HR wallet mismatch" (sourceAllocation.allocationHrWallet == hrWallet)
+        assertMsg "Source allocation employer wallet mismatch" (sourceAllocation.allocationEmployerWallet == employerWallet)
+        assertMsg "Source allocation employee wallet mismatch" (sourceAllocation.allocationEmployeeWallet == settlementEmployeeWallet)
+        assertMsg "Source allocation company ID mismatch" (sourceAllocation.allocationCompanyId == companyId)
+        assertMsg "Source allocation company admin mismatch" (sourceAllocation.companyAdmin == this.companyAdmin)
+        assertMsg "Source allocation payroll ID mismatch" (sourceAllocation.allocationPayrollId == payrollId)
+        assertMsg "Source allocation period mismatch" (sourceAllocation.allocationPeriod == payrollPeriod)
+        assertMsg "Source allocation currency mismatch" (sourceAllocation.allocationCurrency == payrollCurrency)
+        assertMsg "Source allocation external ID mismatch" (sourceAllocation.employeeExternalId == settlementEmployeeExternalId)
+        assertMsg "Source allocation amount mismatch" (sourceAllocation.salaryBreakdown.netPay == settlementAmount)
+
+        create this with settledAmount = settledAmount + settlementAmount
+
+    choice ClosePayrollByHR : ContractId PayrollVault
+      controller hrWallet
+      do
+        now <- getTime
+        assertMsg "Payroll must be active before closure" (vaultStatus == Active)
+        assertMsg "Claim window must be over" (now > claimWindowEnd)
+        create this with vaultStatus = Closed
+
+    choice ClosePayrollByEmployer : ContractId PayrollVault
+      controller employerWallet
+      do
+        now <- getTime
+        assertMsg "Payroll must be active before closure" (vaultStatus == Active)
+        assertMsg "Claim window must be over" (now > claimWindowEnd)
+        create this with vaultStatus = Closed
+
+    choice CancelPayrollBeforeFunding : (ContractId PayrollVault, ContractId PayrollCancellationReceipt)
+      with
+        cancellationReason : Text
+      controller hrWallet
+      do
+        assertMsg "Cancellation reason is required" (nonEmptyText cancellationReason)
+        assertMsg "HR can cancel only before funding" (vaultStatus == Created || vaultStatus == AllocationsFinalized)
+
+        now <- getTime
+        cancellationReceiptCid <- create PayrollCancellationReceipt with
+          cancellationActor = hrWallet
+          cancellationHrWallet = hrWallet
+          cancellationEmployerWallet = employerWallet
+          cancellationCompanyId = companyId
+          cancellationPayrollId = payrollId
+          cancellationPeriod = payrollPeriod
+          cancellationReason
+          companyAdmin = this.companyAdmin
+          cancelledAt = now
+
+        updatedVaultCid <- create this with vaultStatus = CancelledByHR
+        return (updatedVaultCid, cancellationReceiptCid)
+
+    choice CancelPayrollAfterFunding : (ContractId PayrollVault, ContractId PayrollCancellationReceipt)
+      with
+        cancellationReason : Text
+      controller employerWallet
+      do
+        assertMsg "Cancellation reason is required" (nonEmptyText cancellationReason)
+        assertMsg "Employer can cancel only after funding and before activation" (vaultStatus == Funded)
+
+        now <- getTime
+        cancellationReceiptCid <- create PayrollCancellationReceipt with
+          cancellationActor = employerWallet
+          cancellationHrWallet = hrWallet
+          cancellationEmployerWallet = employerWallet
+          cancellationCompanyId = companyId
+          cancellationPayrollId = payrollId
+          cancellationPeriod = payrollPeriod
+          cancellationReason
+          companyAdmin = this.companyAdmin
+          cancelledAt = now
+
+        updatedVaultCid <- create this with vaultStatus = CancelledAfterFunding
+        return (updatedVaultCid, cancellationReceiptCid)
+
+    choice WithdrawLeftovers : (ContractId PayrollVault, ContractId LeftoverWithdrawalReceipt)
+      with
+        withdrawalReference : Text
+      controller employerWallet
+      do
+        now <- getTime
+        assertMsg "Withdrawal reference is required" (nonEmptyText withdrawalReference)
+        assertMsg "Leftovers can only be withdrawn after payroll is closed or cancelled after funding" (vaultStatus == Closed || vaultStatus == CancelledAfterFunding)
+
+        if vaultStatus == Closed then
+          assertMsg "Closed payroll leftovers can only be withdrawn after claim window" (now > claimWindowEnd)
+        else
+          return ()
+
+        let leftoverAmount = fundedAmount - settledAmount - withdrawnAmount
+        assertMsg "No leftover funds to withdraw" (leftoverAmount > 0.0)
+
+        leftoverCid <- create LeftoverWithdrawalReceipt with
+          leftoverEmployerWallet = employerWallet
+          leftoverHrWallet = hrWallet
+          leftoverCompanyId = companyId
+          leftoverPayrollId = payrollId
+          leftoverPeriod = payrollPeriod
+          leftoverCurrency = payrollCurrency
+          leftoverAmount
+          withdrawalReference
+          companyAdmin = this.companyAdmin
+          withdrawnAt = now
+
+        updatedVaultCid <- create this with withdrawnAmount = withdrawnAmount + leftoverAmount
+        return (updatedVaultCid, leftoverCid)
+
+template SalaryAllocation
+  with
+    allocationHrWallet : Party
+    allocationEmployerWallet : Party
+    allocationEmployeeWallet : Party
+    allocationCompanyId : Text
+    allocationPayrollId : Text
+    allocationPeriod : PayrollPeriod
+    allocationCurrency : Text
+    employeeExternalId : Text
+    salaryBreakdown : SalaryBreakdown
+    allocationStatus : AllocationStatus
+    allocationCreatedAt : Time
+    companyAdmin : Party
+  where
+    signatory allocationHrWallet, this.companyAdmin
+    observer allocationEmployeeWallet, allocationEmployerWallet
+
+    ensure
+      nonEmptyText allocationCompanyId
+        && nonEmptyText allocationPayrollId
+        && nonEmptyText allocationCurrency
+        && nonEmptyText employeeExternalId
+        && validPayrollPeriod allocationPeriod
+        && validSalaryBreakdown salaryBreakdown
+        && salaryBreakdown.currency == allocationCurrency
+
+    key (this.companyAdmin, allocationCompanyId, allocationPayrollId, employeeExternalId) : (Party, Text, Text, Text)
+    maintainer key._1
+
+    choice IssueClaimTicket : (ContractId SalaryAllocation, ContractId ClaimTicket)
+      with
+        payrollVaultCid : ContractId PayrollVault
+      controller allocationHrWallet
+      do
+        payrollVault <- fetch payrollVaultCid
+        now <- getTime
+
+        assertMsg "Allocation must be newly created before claim ticket is issued" (allocationStatus == AllocationCreated)
+        assertMsg "Payroll must be active before issuing claim tickets" (payrollVault.vaultStatus == Active)
+        assertMsg "Claim window has not opened" (now >= payrollVault.claimWindowStart)
+        assertMsg "Claim window has expired" (now <= payrollVault.claimWindowEnd)
+        assertMsg "HR wallet mismatch" (payrollVault.hrWallet == allocationHrWallet)
+        assertMsg "Employer wallet mismatch" (payrollVault.employerWallet == allocationEmployerWallet)
+        assertMsg "Company ID mismatch" (payrollVault.companyId == allocationCompanyId)
+        assertMsg "Company admin mismatch" (payrollVault.companyAdmin == this.companyAdmin)
+        assertMsg "Payroll ID mismatch" (payrollVault.payrollId == allocationPayrollId)
+        assertMsg "Payroll period mismatch" (payrollVault.payrollPeriod == allocationPeriod)
+        assertMsg "Payroll currency mismatch" (payrollVault.payrollCurrency == allocationCurrency)
+        assertMsg "Allocation employee is not in payroll vault" (elem allocationEmployeeWallet payrollVault.allocatedEmployees)
+        assertMsg "Allocation employee external ID is not in payroll vault" (elem employeeExternalId payrollVault.allocatedEmployeeExternalIds)
+
+        updatedAllocationCid <- create this with allocationStatus = AllocationClaimTicketIssued
+
+        ticketCid <- create ClaimTicket with
+          ticketHrWallet = allocationHrWallet
+          ticketEmployerWallet = allocationEmployerWallet
+          ticketEmployeeWallet = allocationEmployeeWallet
+          ticketCompanyId = allocationCompanyId
+          ticketPayrollId = allocationPayrollId
+          ticketPeriod = allocationPeriod
+          ticketCurrency = allocationCurrency
+          ticketEmployeeExternalId = employeeExternalId
+          ticketSalaryBreakdown = salaryBreakdown
+          ticketAmount = salaryBreakdown.netPay
+          sourceAllocationCid = updatedAllocationCid
+          ticketClaimWindowStart = payrollVault.claimWindowStart
+          ticketClaimWindowEnd = payrollVault.claimWindowEnd
+          ticketIssuedAt = now
+          companyAdmin = this.companyAdmin
+        return (updatedAllocationCid, ticketCid)
+
+    choice MarkSettled : ContractId SalaryAllocation
+      with
+        expectedEmployeeWallet : Party
+        expectedPayrollId : Text
+        expectedEmployeeExternalId : Text
+        expectedAmount : Decimal
+        settlementAuthCid : ContractId ClaimActionAuthorization
+      controller allocationEmployerWallet
+      do
+        auth <- exercise settlementAuthCid ConsumeClaimActionAuthorization
+
+        assertMsg "Allocation must be ticket-issued before settlement" (allocationStatus == AllocationClaimTicketIssued)
+        assertMsg "Employee wallet mismatch" (allocationEmployeeWallet == expectedEmployeeWallet)
+        assertMsg "Payroll ID mismatch" (allocationPayrollId == expectedPayrollId)
+        assertMsg "Employee external ID mismatch" (employeeExternalId == expectedEmployeeExternalId)
+        assertMsg "Amount mismatch" (salaryBreakdown.netPay == expectedAmount)
+        assertMsg "Settlement authorization action mismatch" (auth.authAction == SettlementAction)
+        assertMsg "Settlement authorization source allocation mismatch" (auth.authSourceAllocationCid == self)
+        assertMsg "Settlement authorization HR wallet mismatch" (auth.authHrWallet == allocationHrWallet)
+        assertMsg "Settlement authorization employer wallet mismatch" (auth.authEmployerWallet == allocationEmployerWallet)
+        assertMsg "Settlement authorization employee wallet mismatch" (auth.authEmployeeWallet == allocationEmployeeWallet)
+        assertMsg "Settlement authorization company ID mismatch" (auth.authCompanyId == allocationCompanyId)
+        assertMsg "Settlement authorization payroll ID mismatch" (auth.authPayrollId == allocationPayrollId)
+        assertMsg "Settlement authorization period mismatch" (auth.authPeriod == allocationPeriod)
+        assertMsg "Settlement authorization currency mismatch" (auth.authCurrency == allocationCurrency)
+        assertMsg "Settlement authorization external ID mismatch" (auth.authEmployeeExternalId == employeeExternalId)
+        assertMsg "Settlement authorization amount mismatch" (auth.authAmount == expectedAmount)
+        assertMsg "Settlement authorization company admin mismatch" (auth.companyAdmin == this.companyAdmin)
+        create this with allocationStatus = AllocationSettled
+
+    choice MarkRejected : ContractId SalaryAllocation
+      with
+        expectedEmployeeWallet : Party
+        expectedPayrollId : Text
+        expectedEmployeeExternalId : Text
+        expectedAmount : Decimal
+        rejectionAuthCid : ContractId ClaimActionAuthorization
+      controller allocationEmployerWallet
+      do
+        auth <- exercise rejectionAuthCid ConsumeClaimActionAuthorization
+
+        assertMsg "Allocation must be ticket-issued before rejection" (allocationStatus == AllocationClaimTicketIssued)
+        assertMsg "Employee wallet mismatch" (allocationEmployeeWallet == expectedEmployeeWallet)
+        assertMsg "Payroll ID mismatch" (allocationPayrollId == expectedPayrollId)
+        assertMsg "Employee external ID mismatch" (employeeExternalId == expectedEmployeeExternalId)
+        assertMsg "Amount mismatch" (salaryBreakdown.netPay == expectedAmount)
+        assertMsg "Rejection authorization action mismatch" (auth.authAction == RejectionAction)
+        assertMsg "Rejection authorization source allocation mismatch" (auth.authSourceAllocationCid == self)
+        assertMsg "Rejection authorization HR wallet mismatch" (auth.authHrWallet == allocationHrWallet)
+        assertMsg "Rejection authorization employer wallet mismatch" (auth.authEmployerWallet == allocationEmployerWallet)
+        assertMsg "Rejection authorization employee wallet mismatch" (auth.authEmployeeWallet == allocationEmployeeWallet)
+        assertMsg "Rejection authorization company ID mismatch" (auth.authCompanyId == allocationCompanyId)
+        assertMsg "Rejection authorization payroll ID mismatch" (auth.authPayrollId == allocationPayrollId)
+        assertMsg "Rejection authorization period mismatch" (auth.authPeriod == allocationPeriod)
+        assertMsg "Rejection authorization currency mismatch" (auth.authCurrency == allocationCurrency)
+        assertMsg "Rejection authorization external ID mismatch" (auth.authEmployeeExternalId == employeeExternalId)
+        assertMsg "Rejection authorization amount mismatch" (auth.authAmount == expectedAmount)
+        assertMsg "Rejection authorization company admin mismatch" (auth.companyAdmin == this.companyAdmin)
+        create this with allocationStatus = AllocationClaimRejected
+
+template ClaimTicket
+  with
+    ticketHrWallet : Party
+    ticketEmployerWallet : Party
+    ticketEmployeeWallet : Party
+    ticketCompanyId : Text
+    ticketPayrollId : Text
+    ticketPeriod : PayrollPeriod
+    ticketCurrency : Text
+    ticketEmployeeExternalId : Text
+    ticketSalaryBreakdown : SalaryBreakdown
+    ticketAmount : Decimal
+    sourceAllocationCid : ContractId SalaryAllocation
+    ticketClaimWindowStart : Time
+    ticketClaimWindowEnd : Time
+    ticketIssuedAt : Time
+    companyAdmin : Party
+  where
+    signatory ticketHrWallet, this.companyAdmin
+    observer ticketEmployeeWallet, ticketEmployerWallet
+
+    ensure
+      ticketAmount > 0.0
+        && nonEmptyText ticketCompanyId
+        && nonEmptyText ticketPayrollId
+        && nonEmptyText ticketCurrency
+        && nonEmptyText ticketEmployeeExternalId
+        && validPayrollPeriod ticketPeriod
+        && validSalaryBreakdown ticketSalaryBreakdown
+        && ticketSalaryBreakdown.currency == ticketCurrency
+        && ticketAmount == ticketSalaryBreakdown.netPay
+        && ticketClaimWindowStart < ticketClaimWindowEnd
+
+    key (this.companyAdmin, ticketCompanyId, ticketPayrollId, ticketEmployeeExternalId) : (Party, Text, Text, Text)
+    maintainer key._1
+
+    choice RequestSalaryClaim : ContractId SalaryClaim
+      controller ticketEmployeeWallet
+      do
+        sourceAllocation <- fetch sourceAllocationCid
+        now <- getTime
+
+        assertMsg "Claim window has not opened" (now >= ticketClaimWindowStart)
+        assertMsg "Claim window has expired" (now <= ticketClaimWindowEnd)
+        assertMsg "Source allocation must be ticket-issued" (sourceAllocation.allocationStatus == AllocationClaimTicketIssued)
+        assertMsg "Source allocation HR wallet mismatch" (sourceAllocation.allocationHrWallet == ticketHrWallet)
+        assertMsg "Source allocation employer wallet mismatch" (sourceAllocation.allocationEmployerWallet == ticketEmployerWallet)
+        assertMsg "Source allocation employee wallet mismatch" (sourceAllocation.allocationEmployeeWallet == ticketEmployeeWallet)
+        assertMsg "Source allocation company ID mismatch" (sourceAllocation.allocationCompanyId == ticketCompanyId)
+        assertMsg "Source allocation company admin mismatch" (sourceAllocation.companyAdmin == this.companyAdmin)
+        assertMsg "Source allocation payroll ID mismatch" (sourceAllocation.allocationPayrollId == ticketPayrollId)
+        assertMsg "Source allocation period mismatch" (sourceAllocation.allocationPeriod == ticketPeriod)
+        assertMsg "Source allocation currency mismatch" (sourceAllocation.allocationCurrency == ticketCurrency)
+        assertMsg "Source allocation amount mismatch" (sourceAllocation.salaryBreakdown.netPay == ticketAmount)
+
+        create SalaryClaim with
+          claimHrWallet = ticketHrWallet
+          claimEmployerWallet = ticketEmployerWallet
+          claimEmployeeWallet = ticketEmployeeWallet
+          claimCompanyId = ticketCompanyId
+          claimPayrollId = ticketPayrollId
+          claimPeriod = ticketPeriod
+          claimCurrency = ticketCurrency
+          claimEmployeeExternalId = ticketEmployeeExternalId
+          claimSalaryBreakdown = ticketSalaryBreakdown
+          claimAmount = ticketAmount
+          sourceAllocationCid
+          claimStatus = ClaimRequested
+          requestedAt = now
+          companyAdmin = this.companyAdmin
+template SalaryClaim
+  with
+    claimHrWallet : Party
+    claimEmployerWallet : Party
+    claimEmployeeWallet : Party
+    claimCompanyId : Text
+    claimPayrollId : Text
+    claimPeriod : PayrollPeriod
+    claimCurrency : Text
+    claimEmployeeExternalId : Text
+    claimSalaryBreakdown : SalaryBreakdown
+    claimAmount : Decimal
+    sourceAllocationCid : ContractId SalaryAllocation
+    claimStatus : ClaimStatus
+    requestedAt : Time
+    companyAdmin : Party
+  where
+    signatory claimEmployeeWallet
+    observer claimHrWallet, claimEmployerWallet, this.companyAdmin
+
+    ensure
+      claimAmount > 0.0
+        && nonEmptyText claimCompanyId
+        && nonEmptyText claimPayrollId
+        && nonEmptyText claimCurrency
+        && nonEmptyText claimEmployeeExternalId
+        && validPayrollPeriod claimPeriod
+        && validSalaryBreakdown claimSalaryBreakdown
+        && claimSalaryBreakdown.currency == claimCurrency
+        && claimAmount == claimSalaryBreakdown.netPay
+
+    key (claimEmployeeWallet, claimCompanyId, claimPayrollId, claimEmployeeExternalId) : (Party, Text, Text, Text)
+    maintainer key._1
+
+    choice ConfirmSalarySettlement
+      : (ContractId PayrollVault, ContractId SalaryAllocation, ContractId SettlementReceipt, ContractId Payslip, ContractId SettledSalaryRecord)
+      with
+        payrollVaultCid : ContractId PayrollVault
+        settlementReference : Text
+      controller claimEmployerWallet
+      do
+        payrollVault <- fetch payrollVaultCid
+        sourceAllocation <- fetch sourceAllocationCid
+
+        assertMsg "Settlement reference is required" (nonEmptyText settlementReference)
+        assertMsg "Claim must be requested before settlement" (claimStatus == ClaimRequested)
+        assertMsg "Payroll must be active or closed before settlement" (payrollVault.vaultStatus == Active || payrollVault.vaultStatus == Closed)
+        assertMsg "Payroll HR wallet mismatch" (payrollVault.hrWallet == claimHrWallet)
+        assertMsg "Payroll employer wallet mismatch" (payrollVault.employerWallet == claimEmployerWallet)
+        assertMsg "Payroll company ID mismatch" (payrollVault.companyId == claimCompanyId)
+        assertMsg "Payroll company admin mismatch" (payrollVault.companyAdmin == this.companyAdmin)
+        assertMsg "Payroll ID mismatch" (payrollVault.payrollId == claimPayrollId)
+        assertMsg "Payroll period mismatch" (payrollVault.payrollPeriod == claimPeriod)
+        assertMsg "Payroll currency mismatch" (payrollVault.payrollCurrency == claimCurrency)
+        assertMsg "Settlement cannot exceed remaining funded amount" (payrollVault.settledAmount + payrollVault.withdrawnAmount + claimAmount <= payrollVault.fundedAmount)
+
+        assertMsg "Source allocation must be ticket-issued" (sourceAllocation.allocationStatus == AllocationClaimTicketIssued)
+        assertMsg "Source allocation HR wallet mismatch" (sourceAllocation.allocationHrWallet == claimHrWallet)
+        assertMsg "Source allocation employer wallet mismatch" (sourceAllocation.allocationEmployerWallet == claimEmployerWallet)
+        assertMsg "Source allocation employee wallet mismatch" (sourceAllocation.allocationEmployeeWallet == claimEmployeeWallet)
+        assertMsg "Source allocation company ID mismatch" (sourceAllocation.allocationCompanyId == claimCompanyId)
+        assertMsg "Source allocation company admin mismatch" (sourceAllocation.companyAdmin == this.companyAdmin)
+        assertMsg "Source allocation payroll ID mismatch" (sourceAllocation.allocationPayrollId == claimPayrollId)
+        assertMsg "Source allocation period mismatch" (sourceAllocation.allocationPeriod == claimPeriod)
+        assertMsg "Source allocation currency mismatch" (sourceAllocation.allocationCurrency == claimCurrency)
+        assertMsg "Source allocation external ID mismatch" (sourceAllocation.employeeExternalId == claimEmployeeExternalId)
+        assertMsg "Source allocation amount mismatch" (sourceAllocation.salaryBreakdown.netPay == claimAmount)
+
+        now <- getTime
+
+        vaultSettlementAuthCid <- create ClaimActionAuthorization with
+          authHrWallet = claimHrWallet
+          authEmployerWallet = claimEmployerWallet
+          authEmployeeWallet = claimEmployeeWallet
+          authCompanyId = claimCompanyId
+          authPayrollId = claimPayrollId
+          authPeriod = claimPeriod
+          authCurrency = claimCurrency
+          authEmployeeExternalId = claimEmployeeExternalId
+          authAmount = claimAmount
+          authSourceAllocationCid = sourceAllocationCid
+          authAction = SettlementAction
+          companyAdmin = this.companyAdmin
+          authorizedAt = now
+
+        allocationSettlementAuthCid <- create ClaimActionAuthorization with
+          authHrWallet = claimHrWallet
+          authEmployerWallet = claimEmployerWallet
+          authEmployeeWallet = claimEmployeeWallet
+          authCompanyId = claimCompanyId
+          authPayrollId = claimPayrollId
+          authPeriod = claimPeriod
+          authCurrency = claimCurrency
+          authEmployeeExternalId = claimEmployeeExternalId
+          authAmount = claimAmount
+          authSourceAllocationCid = sourceAllocationCid
+          authAction = SettlementAction
+          companyAdmin = this.companyAdmin
+          authorizedAt = now
+
+        updatedVaultCid <- exercise payrollVaultCid RecordSettlement with
+          settlementEmployeeWallet = claimEmployeeWallet
+          settlementEmployeeExternalId = claimEmployeeExternalId
+          settlementAmount = claimAmount
+          settlementAuthCid = vaultSettlementAuthCid
+
+        settledAllocationCid <- exercise sourceAllocationCid MarkSettled with
+          expectedEmployeeWallet = claimEmployeeWallet
+          expectedPayrollId = claimPayrollId
+          expectedEmployeeExternalId = claimEmployeeExternalId
+          expectedAmount = claimAmount
+          settlementAuthCid = allocationSettlementAuthCid
+
+        settlementReceiptCid <- create SettlementReceipt with
+          receiptEmployerWallet = claimEmployerWallet
+          receiptHrWallet = claimHrWallet
+          receiptEmployeeWallet = claimEmployeeWallet
+          receiptCompanyId = claimCompanyId
+          receiptPayrollId = claimPayrollId
+          receiptPeriod = claimPeriod
+          receiptCurrency = claimCurrency
+          receiptEmployeeExternalId = claimEmployeeExternalId
+          receiptSalaryBreakdown = claimSalaryBreakdown
+          receiptAmount = claimAmount
+          settlementReference
+          companyAdmin = this.companyAdmin
+          settledAt = now
+
+        payslipCid <- create Payslip with
+          payslipEmployerWallet = claimEmployerWallet
+          payslipHrWallet = claimHrWallet
+          payslipEmployeeWallet = claimEmployeeWallet
+          payslipCompanyId = claimCompanyId
+          payslipPayrollId = claimPayrollId
+          payslipPeriod = claimPeriod
+          payslipCurrency = claimCurrency
+          payslipEmployeeExternalId = claimEmployeeExternalId
+          payslipSalaryBreakdown = claimSalaryBreakdown
+          companyAdmin = this.companyAdmin
+          issuedAt = now
+
+        settledRecordCid <- create SettledSalaryRecord with
+          settledRecordEmployerWallet = claimEmployerWallet
+          settledRecordHrWallet = claimHrWallet
+          settledRecordEmployeeWallet = claimEmployeeWallet
+          settledRecordCompanyId = claimCompanyId
+          settledRecordPayrollId = claimPayrollId
+          settledRecordPeriod = claimPeriod
+          settledRecordCurrency = claimCurrency
+          settledRecordEmployeeExternalId = claimEmployeeExternalId
+          settledRecordAmount = claimAmount
+          settledRecordReference = settlementReference
+          companyAdmin = this.companyAdmin
+          settledRecordAt = now
+
+        return (updatedVaultCid, settledAllocationCid, settlementReceiptCid, payslipCid, settledRecordCid)
+
+    choice RejectSalaryClaim : (ContractId SalaryAllocation, ContractId FailedSalaryClaim)
+      with
+        failureReason : Text
+      controller claimEmployerWallet
+      do
+        sourceAllocation <- fetch sourceAllocationCid
+
+        assertMsg "Failure reason is required" (nonEmptyText failureReason)
+        assertMsg "Claim must be requested before rejection" (claimStatus == ClaimRequested)
+        assertMsg "Source allocation must be ticket-issued" (sourceAllocation.allocationStatus == AllocationClaimTicketIssued)
+        assertMsg "Source allocation HR wallet mismatch" (sourceAllocation.allocationHrWallet == claimHrWallet)
+        assertMsg "Source allocation employer wallet mismatch" (sourceAllocation.allocationEmployerWallet == claimEmployerWallet)
+        assertMsg "Source allocation employee wallet mismatch" (sourceAllocation.allocationEmployeeWallet == claimEmployeeWallet)
+        assertMsg "Source allocation company ID mismatch" (sourceAllocation.allocationCompanyId == claimCompanyId)
+        assertMsg "Source allocation payroll ID mismatch" (sourceAllocation.allocationPayrollId == claimPayrollId)
+        assertMsg "Source allocation period mismatch" (sourceAllocation.allocationPeriod == claimPeriod)
+        assertMsg "Source allocation currency mismatch" (sourceAllocation.allocationCurrency == claimCurrency)
+        assertMsg "Source allocation external ID mismatch" (sourceAllocation.employeeExternalId == claimEmployeeExternalId)
+        assertMsg "Source allocation company admin mismatch" (sourceAllocation.companyAdmin == this.companyAdmin)
+        assertMsg "Source allocation amount mismatch" (sourceAllocation.salaryBreakdown.netPay == claimAmount)
+
+        now <- getTime
+
+        rejectionAuthCid <- create ClaimActionAuthorization with
+          authHrWallet = claimHrWallet
+          authEmployerWallet = claimEmployerWallet
+          authEmployeeWallet = claimEmployeeWallet
+          authCompanyId = claimCompanyId
+          authPayrollId = claimPayrollId
+          authPeriod = claimPeriod
+          authCurrency = claimCurrency
+          authEmployeeExternalId = claimEmployeeExternalId
+          authAmount = claimAmount
+          authSourceAllocationCid = sourceAllocationCid
+          authAction = RejectionAction
+          companyAdmin = this.companyAdmin
+          authorizedAt = now
+
+        rejectedAllocationCid <- exercise sourceAllocationCid MarkRejected with
+          expectedEmployeeWallet = claimEmployeeWallet
+          expectedPayrollId = claimPayrollId
+          expectedEmployeeExternalId = claimEmployeeExternalId
+          expectedAmount = claimAmount
+          rejectionAuthCid
+
+        failedClaimCid <- create FailedSalaryClaim with
+          failedEmployerWallet = claimEmployerWallet
+          failedHrWallet = claimHrWallet
+          failedEmployeeWallet = claimEmployeeWallet
+          failedCompanyId = claimCompanyId
+          failedPayrollId = claimPayrollId
+          failedPeriod = claimPeriod
+          failedCurrency = claimCurrency
+          failedEmployeeExternalId = claimEmployeeExternalId
+          failedSalaryBreakdown = claimSalaryBreakdown
+          failedAmount = claimAmount
+          failureReason
+          companyAdmin = this.companyAdmin
+          failedAt = now
+
+        return (rejectedAllocationCid, failedClaimCid)
+
