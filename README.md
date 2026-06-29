@@ -32,12 +32,12 @@ Funding may include an optional transfer proof. Settlement requires a transfer p
 ## Build And Test
 
 ```bash
-dpm build
-dpm test
+daml build
+daml test
 ```
 
-The v0.4 DAR is generated at:
+The DAR is generated at:
 
 ```bash
-.daml/dist/zalary-contracts-0.4.0.dar
+.daml/dist/zalary-usdcx-contracts-0.1.0.dar
 ```
