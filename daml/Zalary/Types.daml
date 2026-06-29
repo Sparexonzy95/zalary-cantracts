@@ -1,6 +1,7 @@
 module Zalary.Types where
 
 import DA.Date
+import DA.Time
 
 -- Strict payroll lifecycle:
 -- Created -> AllocationsFinalized -> Funded -> Active -> Closed
@@ -44,13 +45,34 @@ data PayrollPeriod = PayrollPeriod
     endsAt : Date
   deriving (Eq, Show)
 
+data TokenInstrument = TokenInstrument
+  with
+    symbol : Text
+    instrumentId : Text
+    instrumentAdmin : Party
+    utilityApiUrl : Text
+    xReserveApiUrl : Text
+  deriving (Eq, Show)
+
+data TokenTransferProof = TokenTransferProof
+  with
+    token : TokenInstrument
+    sender : Party
+    receiver : Party
+    amount : Decimal
+    transferReference : Text
+    transferInstructionCid : Optional Text
+    holdingCid : Optional Text
+    executedAt : Time
+  deriving (Eq, Show)
+
 data SalaryBreakdown = SalaryBreakdown
   with
     grossPay : Decimal
     allowances : Decimal
     deductions : Decimal
     netPay : Decimal
-    currency : Text
+    token : TokenInstrument
   deriving (Eq, Show)
 
 nonEmptyText : Text -> Bool
@@ -66,6 +88,44 @@ isSubset : Eq a => [a] -> [a] -> Bool
 isSubset values allowedValues =
   all (\value -> elem value allowedValues) values
 
+validOptionalText : Optional Text -> Bool
+validOptionalText value =
+  case value of
+    None -> True
+    Some text -> nonEmptyText text
+
+validTokenInstrument : TokenInstrument -> Bool
+validTokenInstrument token =
+  nonEmptyText token.symbol
+    && nonEmptyText token.instrumentId
+    && nonEmptyText token.utilityApiUrl
+    && nonEmptyText token.xReserveApiUrl
+
+sameTokenInstrument : TokenInstrument -> TokenInstrument -> Bool
+sameTokenInstrument left right =
+  left.instrumentId == right.instrumentId
+    && left.instrumentAdmin == right.instrumentAdmin
+
+tokenInList : TokenInstrument -> [TokenInstrument] -> Bool
+tokenInList token tokens =
+  case tokens of
+    [] -> False
+    candidate :: rest -> sameTokenInstrument token candidate || tokenInList token rest
+
+tokensUnique : [TokenInstrument] -> Bool
+tokensUnique tokens =
+  case tokens of
+    [] -> True
+    token :: rest -> not (tokenInList token rest) && tokensUnique rest
+
+validTokenTransferProof : TokenTransferProof -> Bool
+validTokenTransferProof proof =
+  validTokenInstrument proof.token
+    && proof.amount > 0.0
+    && nonEmptyText proof.transferReference
+    && validOptionalText proof.transferInstructionCid
+    && validOptionalText proof.holdingCid
+
 validPayrollPeriod : PayrollPeriod -> Bool
 validPayrollPeriod period =
   nonEmptyText period.label && period.startsAt <= period.endsAt
@@ -76,5 +136,5 @@ validSalaryBreakdown salary =
     && salary.allowances >= 0.0
     && salary.deductions >= 0.0
     && salary.netPay > 0.0
-    && nonEmptyText salary.currency
+    && validTokenInstrument salary.token
     && salary.netPay == salary.grossPay + salary.allowances - salary.deductions

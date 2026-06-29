@@ -23,7 +23,7 @@ template ClaimActionAuthorization
     authCompanyId : Text
     authPayrollId : Text
     authPeriod : PayrollPeriod
-    authCurrency : Text
+    authToken : TokenInstrument
     authEmployeeExternalId : Text
     authAmount : Decimal
     authSourceAllocationCid : ContractId SalaryAllocation
@@ -38,7 +38,7 @@ template ClaimActionAuthorization
       authAmount > 0.0
         && nonEmptyText authCompanyId
         && nonEmptyText authPayrollId
-        && nonEmptyText authCurrency
+        && validTokenInstrument authToken
         && nonEmptyText authEmployeeExternalId
         && validPayrollPeriod authPeriod
 
@@ -55,7 +55,7 @@ template PayrollVault
     companyId : Text
     payrollId : Text
     payrollPeriod : PayrollPeriod
-    payrollCurrency : Text
+    payrollToken : TokenInstrument
     claimWindowStart : Time
     claimWindowEnd : Time
     expectedEmployeeCount : Int
@@ -75,7 +75,7 @@ template PayrollVault
     ensure
       nonEmptyText companyId
         && nonEmptyText payrollId
-        && nonEmptyText payrollCurrency
+        && validTokenInstrument payrollToken
         && validPayrollPeriod payrollPeriod
         && claimWindowStart < claimWindowEnd
         && expectedEmployeeCount > 0
@@ -107,7 +107,7 @@ template PayrollVault
 
         assertMsg "Payroll must be in Created status" (vaultStatus == Created)
         assertMsg "Salary breakdown is invalid" (validSalaryBreakdown salaryBreakdown)
-        assertMsg "Salary currency must match payroll currency" (salaryBreakdown.currency == payrollCurrency)
+        assertMsg "Salary token must match payroll token" (sameTokenInstrument salaryBreakdown.token payrollToken)
         assertMsg "Employee already has allocation" (not (elem allocationEmployeeWallet allocatedEmployees))
         assertMsg "Employee external ID already has allocation" (not (elem employeeExternalId allocatedEmployeeExternalIds))
         assertMsg "Uploaded allocation count cannot exceed expected employee count" (uploadedAllocationCount < expectedEmployeeCount)
@@ -128,7 +128,7 @@ template PayrollVault
           allocationCompanyId = companyId
           allocationPayrollId = payrollId
           allocationPeriod = payrollPeriod
-          allocationCurrency = payrollCurrency
+          allocationToken = payrollToken
           employeeExternalId
           salaryBreakdown
           allocationStatus = AllocationCreated
@@ -152,16 +152,26 @@ template PayrollVault
 
     choice ConfirmFunding : (ContractId PayrollVault, ContractId FundingReceipt)
       with
-        stableToken : Text
         fundingAmount : Decimal
         fundingReference : Text
+        fundingProof : Optional TokenTransferProof
       controller employerWallet
       do
         assertMsg "Payroll must be finalized before funding" (vaultStatus == AllocationsFinalized)
         assertMsg "Funding reference is required" (nonEmptyText fundingReference)
-        assertMsg "Funding token must match payroll currency" (stableToken == payrollCurrency)
         assertMsg "Funding amount must be positive" (fundingAmount > 0.0)
         assertMsg "Funding amount must cover total net pay" (fundingAmount >= totalNetPay)
+
+        case fundingProof of
+          None -> return ()
+          Some proof -> do
+            assertMsg "Funding transfer proof is invalid" (validTokenTransferProof proof)
+            assertMsg "Funding proof token mismatch" (sameTokenInstrument proof.token payrollToken)
+            assertMsg "Funding proof sender mismatch" (proof.sender == employerWallet)
+            assertMsg "Funding proof receiver mismatch" (proof.receiver == this.companyAdmin)
+            assertMsg "Funding proof amount mismatch" (proof.amount == fundingAmount)
+            assertMsg "Funding proof amount must cover total net pay" (proof.amount >= totalNetPay)
+            assertMsg "Funding proof reference mismatch" (proof.transferReference == fundingReference)
 
         now <- getTime
         fundingReceiptCid <- create FundingReceipt with
@@ -170,9 +180,10 @@ template PayrollVault
           fundingCompanyId = companyId
           fundingPayrollId = payrollId
           fundingPeriod = payrollPeriod
-          fundingCurrency = stableToken
+          fundingToken = payrollToken
           fundingAmount
           fundingReference
+          fundingProof
           companyAdmin = this.companyAdmin
           fundedAt = now
 
@@ -195,6 +206,7 @@ template PayrollVault
         settlementEmployeeWallet : Party
         settlementEmployeeExternalId : Text
         settlementAmount : Decimal
+        settlementProof : TokenTransferProof
         settlementAuthCid : ContractId ClaimActionAuthorization
       controller employerWallet
       do
@@ -204,6 +216,11 @@ template PayrollVault
         assertMsg "Payroll must be active or closed before settlement" (vaultStatus == Active || vaultStatus == Closed)
         assertMsg "Settlement amount must be positive" (settlementAmount > 0.0)
         assertMsg "Settlement cannot exceed remaining funded amount" (settledAmount + withdrawnAmount + settlementAmount <= fundedAmount)
+        assertMsg "Settlement transfer proof is invalid" (validTokenTransferProof settlementProof)
+        assertMsg "Settlement proof token mismatch" (sameTokenInstrument settlementProof.token payrollToken)
+        assertMsg "Settlement proof sender mismatch" (settlementProof.sender == employerWallet)
+        assertMsg "Settlement proof receiver mismatch" (settlementProof.receiver == settlementEmployeeWallet)
+        assertMsg "Settlement proof amount mismatch" (settlementProof.amount == settlementAmount)
         assertMsg "Settlement authorization action mismatch" (auth.authAction == SettlementAction)
         assertMsg "Settlement authorization HR wallet mismatch" (auth.authHrWallet == hrWallet)
         assertMsg "Settlement authorization employer wallet mismatch" (auth.authEmployerWallet == employerWallet)
@@ -212,7 +229,7 @@ template PayrollVault
         assertMsg "Settlement authorization company ID mismatch" (auth.authCompanyId == companyId)
         assertMsg "Settlement authorization payroll ID mismatch" (auth.authPayrollId == payrollId)
         assertMsg "Settlement authorization period mismatch" (auth.authPeriod == payrollPeriod)
-        assertMsg "Settlement authorization currency mismatch" (auth.authCurrency == payrollCurrency)
+        assertMsg "Settlement authorization token mismatch" (sameTokenInstrument auth.authToken payrollToken)
         assertMsg "Settlement authorization amount mismatch" (auth.authAmount == settlementAmount)
         assertMsg "Settlement authorization company admin mismatch" (auth.companyAdmin == this.companyAdmin)
         assertMsg "Source allocation must be ticket-issued" (sourceAllocation.allocationStatus == AllocationClaimTicketIssued)
@@ -223,7 +240,7 @@ template PayrollVault
         assertMsg "Source allocation company admin mismatch" (sourceAllocation.companyAdmin == this.companyAdmin)
         assertMsg "Source allocation payroll ID mismatch" (sourceAllocation.allocationPayrollId == payrollId)
         assertMsg "Source allocation period mismatch" (sourceAllocation.allocationPeriod == payrollPeriod)
-        assertMsg "Source allocation currency mismatch" (sourceAllocation.allocationCurrency == payrollCurrency)
+        assertMsg "Source allocation token mismatch" (sameTokenInstrument sourceAllocation.allocationToken payrollToken)
         assertMsg "Source allocation external ID mismatch" (sourceAllocation.employeeExternalId == settlementEmployeeExternalId)
         assertMsg "Source allocation amount mismatch" (sourceAllocation.salaryBreakdown.netPay == settlementAmount)
 
@@ -314,7 +331,7 @@ template PayrollVault
           leftoverCompanyId = companyId
           leftoverPayrollId = payrollId
           leftoverPeriod = payrollPeriod
-          leftoverCurrency = payrollCurrency
+          leftoverToken = payrollToken
           leftoverAmount
           withdrawalReference
           companyAdmin = this.companyAdmin
@@ -331,7 +348,7 @@ template SalaryAllocation
     allocationCompanyId : Text
     allocationPayrollId : Text
     allocationPeriod : PayrollPeriod
-    allocationCurrency : Text
+    allocationToken : TokenInstrument
     employeeExternalId : Text
     salaryBreakdown : SalaryBreakdown
     allocationStatus : AllocationStatus
@@ -344,11 +361,11 @@ template SalaryAllocation
     ensure
       nonEmptyText allocationCompanyId
         && nonEmptyText allocationPayrollId
-        && nonEmptyText allocationCurrency
+        && validTokenInstrument allocationToken
         && nonEmptyText employeeExternalId
         && validPayrollPeriod allocationPeriod
         && validSalaryBreakdown salaryBreakdown
-        && salaryBreakdown.currency == allocationCurrency
+        && sameTokenInstrument salaryBreakdown.token allocationToken
 
     key (this.companyAdmin, allocationCompanyId, allocationPayrollId, employeeExternalId) : (Party, Text, Text, Text)
     maintainer key._1
@@ -371,7 +388,7 @@ template SalaryAllocation
         assertMsg "Company admin mismatch" (payrollVault.companyAdmin == this.companyAdmin)
         assertMsg "Payroll ID mismatch" (payrollVault.payrollId == allocationPayrollId)
         assertMsg "Payroll period mismatch" (payrollVault.payrollPeriod == allocationPeriod)
-        assertMsg "Payroll currency mismatch" (payrollVault.payrollCurrency == allocationCurrency)
+        assertMsg "Payroll token mismatch" (sameTokenInstrument payrollVault.payrollToken allocationToken)
         assertMsg "Allocation employee is not in payroll vault" (elem allocationEmployeeWallet payrollVault.allocatedEmployees)
         assertMsg "Allocation employee external ID is not in payroll vault" (elem employeeExternalId payrollVault.allocatedEmployeeExternalIds)
 
@@ -384,7 +401,7 @@ template SalaryAllocation
           ticketCompanyId = allocationCompanyId
           ticketPayrollId = allocationPayrollId
           ticketPeriod = allocationPeriod
-          ticketCurrency = allocationCurrency
+          ticketToken = allocationToken
           ticketEmployeeExternalId = employeeExternalId
           ticketSalaryBreakdown = salaryBreakdown
           ticketAmount = salaryBreakdown.netPay
@@ -401,6 +418,7 @@ template SalaryAllocation
         expectedPayrollId : Text
         expectedEmployeeExternalId : Text
         expectedAmount : Decimal
+        settlementProof : TokenTransferProof
         settlementAuthCid : ContractId ClaimActionAuthorization
       controller allocationEmployerWallet
       do
@@ -411,6 +429,11 @@ template SalaryAllocation
         assertMsg "Payroll ID mismatch" (allocationPayrollId == expectedPayrollId)
         assertMsg "Employee external ID mismatch" (employeeExternalId == expectedEmployeeExternalId)
         assertMsg "Amount mismatch" (salaryBreakdown.netPay == expectedAmount)
+        assertMsg "Settlement transfer proof is invalid" (validTokenTransferProof settlementProof)
+        assertMsg "Settlement proof token mismatch" (sameTokenInstrument settlementProof.token allocationToken)
+        assertMsg "Settlement proof sender mismatch" (settlementProof.sender == allocationEmployerWallet)
+        assertMsg "Settlement proof receiver mismatch" (settlementProof.receiver == allocationEmployeeWallet)
+        assertMsg "Settlement proof amount mismatch" (settlementProof.amount == expectedAmount)
         assertMsg "Settlement authorization action mismatch" (auth.authAction == SettlementAction)
         assertMsg "Settlement authorization source allocation mismatch" (auth.authSourceAllocationCid == self)
         assertMsg "Settlement authorization HR wallet mismatch" (auth.authHrWallet == allocationHrWallet)
@@ -419,7 +442,7 @@ template SalaryAllocation
         assertMsg "Settlement authorization company ID mismatch" (auth.authCompanyId == allocationCompanyId)
         assertMsg "Settlement authorization payroll ID mismatch" (auth.authPayrollId == allocationPayrollId)
         assertMsg "Settlement authorization period mismatch" (auth.authPeriod == allocationPeriod)
-        assertMsg "Settlement authorization currency mismatch" (auth.authCurrency == allocationCurrency)
+        assertMsg "Settlement authorization token mismatch" (sameTokenInstrument auth.authToken allocationToken)
         assertMsg "Settlement authorization external ID mismatch" (auth.authEmployeeExternalId == employeeExternalId)
         assertMsg "Settlement authorization amount mismatch" (auth.authAmount == expectedAmount)
         assertMsg "Settlement authorization company admin mismatch" (auth.companyAdmin == this.companyAdmin)
@@ -449,7 +472,7 @@ template SalaryAllocation
         assertMsg "Rejection authorization company ID mismatch" (auth.authCompanyId == allocationCompanyId)
         assertMsg "Rejection authorization payroll ID mismatch" (auth.authPayrollId == allocationPayrollId)
         assertMsg "Rejection authorization period mismatch" (auth.authPeriod == allocationPeriod)
-        assertMsg "Rejection authorization currency mismatch" (auth.authCurrency == allocationCurrency)
+        assertMsg "Rejection authorization token mismatch" (sameTokenInstrument auth.authToken allocationToken)
         assertMsg "Rejection authorization external ID mismatch" (auth.authEmployeeExternalId == employeeExternalId)
         assertMsg "Rejection authorization amount mismatch" (auth.authAmount == expectedAmount)
         assertMsg "Rejection authorization company admin mismatch" (auth.companyAdmin == this.companyAdmin)
@@ -463,7 +486,7 @@ template ClaimTicket
     ticketCompanyId : Text
     ticketPayrollId : Text
     ticketPeriod : PayrollPeriod
-    ticketCurrency : Text
+    ticketToken : TokenInstrument
     ticketEmployeeExternalId : Text
     ticketSalaryBreakdown : SalaryBreakdown
     ticketAmount : Decimal
@@ -480,11 +503,11 @@ template ClaimTicket
       ticketAmount > 0.0
         && nonEmptyText ticketCompanyId
         && nonEmptyText ticketPayrollId
-        && nonEmptyText ticketCurrency
+        && validTokenInstrument ticketToken
         && nonEmptyText ticketEmployeeExternalId
         && validPayrollPeriod ticketPeriod
         && validSalaryBreakdown ticketSalaryBreakdown
-        && ticketSalaryBreakdown.currency == ticketCurrency
+        && sameTokenInstrument ticketSalaryBreakdown.token ticketToken
         && ticketAmount == ticketSalaryBreakdown.netPay
         && ticketClaimWindowStart < ticketClaimWindowEnd
 
@@ -507,7 +530,8 @@ template ClaimTicket
         assertMsg "Source allocation company admin mismatch" (sourceAllocation.companyAdmin == this.companyAdmin)
         assertMsg "Source allocation payroll ID mismatch" (sourceAllocation.allocationPayrollId == ticketPayrollId)
         assertMsg "Source allocation period mismatch" (sourceAllocation.allocationPeriod == ticketPeriod)
-        assertMsg "Source allocation currency mismatch" (sourceAllocation.allocationCurrency == ticketCurrency)
+        assertMsg "Source allocation token mismatch" (sameTokenInstrument sourceAllocation.allocationToken ticketToken)
+        assertMsg "Source allocation external ID mismatch" (sourceAllocation.employeeExternalId == ticketEmployeeExternalId)
         assertMsg "Source allocation amount mismatch" (sourceAllocation.salaryBreakdown.netPay == ticketAmount)
 
         create SalaryClaim with
@@ -517,7 +541,7 @@ template ClaimTicket
           claimCompanyId = ticketCompanyId
           claimPayrollId = ticketPayrollId
           claimPeriod = ticketPeriod
-          claimCurrency = ticketCurrency
+          claimToken = ticketToken
           claimEmployeeExternalId = ticketEmployeeExternalId
           claimSalaryBreakdown = ticketSalaryBreakdown
           claimAmount = ticketAmount
@@ -533,7 +557,7 @@ template SalaryClaim
     claimCompanyId : Text
     claimPayrollId : Text
     claimPeriod : PayrollPeriod
-    claimCurrency : Text
+    claimToken : TokenInstrument
     claimEmployeeExternalId : Text
     claimSalaryBreakdown : SalaryBreakdown
     claimAmount : Decimal
@@ -549,11 +573,11 @@ template SalaryClaim
       claimAmount > 0.0
         && nonEmptyText claimCompanyId
         && nonEmptyText claimPayrollId
-        && nonEmptyText claimCurrency
+        && validTokenInstrument claimToken
         && nonEmptyText claimEmployeeExternalId
         && validPayrollPeriod claimPeriod
         && validSalaryBreakdown claimSalaryBreakdown
-        && claimSalaryBreakdown.currency == claimCurrency
+        && sameTokenInstrument claimSalaryBreakdown.token claimToken
         && claimAmount == claimSalaryBreakdown.netPay
 
     key (claimEmployeeWallet, claimCompanyId, claimPayrollId, claimEmployeeExternalId) : (Party, Text, Text, Text)
@@ -564,12 +588,19 @@ template SalaryClaim
       with
         payrollVaultCid : ContractId PayrollVault
         settlementReference : Text
+        settlementProof : TokenTransferProof
       controller claimEmployerWallet
       do
         payrollVault <- fetch payrollVaultCid
         sourceAllocation <- fetch sourceAllocationCid
 
         assertMsg "Settlement reference is required" (nonEmptyText settlementReference)
+        assertMsg "Settlement transfer proof is invalid" (validTokenTransferProof settlementProof)
+        assertMsg "Settlement proof token mismatch" (sameTokenInstrument settlementProof.token claimToken)
+        assertMsg "Settlement proof sender mismatch" (settlementProof.sender == claimEmployerWallet)
+        assertMsg "Settlement proof receiver mismatch" (settlementProof.receiver == claimEmployeeWallet)
+        assertMsg "Settlement proof amount mismatch" (settlementProof.amount == claimAmount)
+        assertMsg "Settlement proof reference mismatch" (settlementProof.transferReference == settlementReference)
         assertMsg "Claim must be requested before settlement" (claimStatus == ClaimRequested)
         assertMsg "Payroll must be active or closed before settlement" (payrollVault.vaultStatus == Active || payrollVault.vaultStatus == Closed)
         assertMsg "Payroll HR wallet mismatch" (payrollVault.hrWallet == claimHrWallet)
@@ -578,7 +609,7 @@ template SalaryClaim
         assertMsg "Payroll company admin mismatch" (payrollVault.companyAdmin == this.companyAdmin)
         assertMsg "Payroll ID mismatch" (payrollVault.payrollId == claimPayrollId)
         assertMsg "Payroll period mismatch" (payrollVault.payrollPeriod == claimPeriod)
-        assertMsg "Payroll currency mismatch" (payrollVault.payrollCurrency == claimCurrency)
+        assertMsg "Payroll token mismatch" (sameTokenInstrument payrollVault.payrollToken claimToken)
         assertMsg "Settlement cannot exceed remaining funded amount" (payrollVault.settledAmount + payrollVault.withdrawnAmount + claimAmount <= payrollVault.fundedAmount)
 
         assertMsg "Source allocation must be ticket-issued" (sourceAllocation.allocationStatus == AllocationClaimTicketIssued)
@@ -589,7 +620,7 @@ template SalaryClaim
         assertMsg "Source allocation company admin mismatch" (sourceAllocation.companyAdmin == this.companyAdmin)
         assertMsg "Source allocation payroll ID mismatch" (sourceAllocation.allocationPayrollId == claimPayrollId)
         assertMsg "Source allocation period mismatch" (sourceAllocation.allocationPeriod == claimPeriod)
-        assertMsg "Source allocation currency mismatch" (sourceAllocation.allocationCurrency == claimCurrency)
+        assertMsg "Source allocation token mismatch" (sameTokenInstrument sourceAllocation.allocationToken claimToken)
         assertMsg "Source allocation external ID mismatch" (sourceAllocation.employeeExternalId == claimEmployeeExternalId)
         assertMsg "Source allocation amount mismatch" (sourceAllocation.salaryBreakdown.netPay == claimAmount)
 
@@ -602,7 +633,7 @@ template SalaryClaim
           authCompanyId = claimCompanyId
           authPayrollId = claimPayrollId
           authPeriod = claimPeriod
-          authCurrency = claimCurrency
+          authToken = claimToken
           authEmployeeExternalId = claimEmployeeExternalId
           authAmount = claimAmount
           authSourceAllocationCid = sourceAllocationCid
@@ -617,7 +648,7 @@ template SalaryClaim
           authCompanyId = claimCompanyId
           authPayrollId = claimPayrollId
           authPeriod = claimPeriod
-          authCurrency = claimCurrency
+          authToken = claimToken
           authEmployeeExternalId = claimEmployeeExternalId
           authAmount = claimAmount
           authSourceAllocationCid = sourceAllocationCid
@@ -629,6 +660,7 @@ template SalaryClaim
           settlementEmployeeWallet = claimEmployeeWallet
           settlementEmployeeExternalId = claimEmployeeExternalId
           settlementAmount = claimAmount
+          settlementProof
           settlementAuthCid = vaultSettlementAuthCid
 
         settledAllocationCid <- exercise sourceAllocationCid MarkSettled with
@@ -636,6 +668,7 @@ template SalaryClaim
           expectedPayrollId = claimPayrollId
           expectedEmployeeExternalId = claimEmployeeExternalId
           expectedAmount = claimAmount
+          settlementProof
           settlementAuthCid = allocationSettlementAuthCid
 
         settlementReceiptCid <- create SettlementReceipt with
@@ -645,11 +678,12 @@ template SalaryClaim
           receiptCompanyId = claimCompanyId
           receiptPayrollId = claimPayrollId
           receiptPeriod = claimPeriod
-          receiptCurrency = claimCurrency
+          receiptToken = claimToken
           receiptEmployeeExternalId = claimEmployeeExternalId
           receiptSalaryBreakdown = claimSalaryBreakdown
           receiptAmount = claimAmount
           settlementReference
+          settlementProof
           companyAdmin = this.companyAdmin
           settledAt = now
 
@@ -660,9 +694,10 @@ template SalaryClaim
           payslipCompanyId = claimCompanyId
           payslipPayrollId = claimPayrollId
           payslipPeriod = claimPeriod
-          payslipCurrency = claimCurrency
+          payslipToken = claimToken
           payslipEmployeeExternalId = claimEmployeeExternalId
           payslipSalaryBreakdown = claimSalaryBreakdown
+          settlementProof
           companyAdmin = this.companyAdmin
           issuedAt = now
 
@@ -673,10 +708,11 @@ template SalaryClaim
           settledRecordCompanyId = claimCompanyId
           settledRecordPayrollId = claimPayrollId
           settledRecordPeriod = claimPeriod
-          settledRecordCurrency = claimCurrency
+          settledRecordToken = claimToken
           settledRecordEmployeeExternalId = claimEmployeeExternalId
           settledRecordAmount = claimAmount
           settledRecordReference = settlementReference
+          settlementProof
           companyAdmin = this.companyAdmin
           settledRecordAt = now
 
@@ -698,7 +734,7 @@ template SalaryClaim
         assertMsg "Source allocation company ID mismatch" (sourceAllocation.allocationCompanyId == claimCompanyId)
         assertMsg "Source allocation payroll ID mismatch" (sourceAllocation.allocationPayrollId == claimPayrollId)
         assertMsg "Source allocation period mismatch" (sourceAllocation.allocationPeriod == claimPeriod)
-        assertMsg "Source allocation currency mismatch" (sourceAllocation.allocationCurrency == claimCurrency)
+        assertMsg "Source allocation token mismatch" (sameTokenInstrument sourceAllocation.allocationToken claimToken)
         assertMsg "Source allocation external ID mismatch" (sourceAllocation.employeeExternalId == claimEmployeeExternalId)
         assertMsg "Source allocation company admin mismatch" (sourceAllocation.companyAdmin == this.companyAdmin)
         assertMsg "Source allocation amount mismatch" (sourceAllocation.salaryBreakdown.netPay == claimAmount)
@@ -712,7 +748,7 @@ template SalaryClaim
           authCompanyId = claimCompanyId
           authPayrollId = claimPayrollId
           authPeriod = claimPeriod
-          authCurrency = claimCurrency
+          authToken = claimToken
           authEmployeeExternalId = claimEmployeeExternalId
           authAmount = claimAmount
           authSourceAllocationCid = sourceAllocationCid
@@ -734,7 +770,7 @@ template SalaryClaim
           failedCompanyId = claimCompanyId
           failedPayrollId = claimPayrollId
           failedPeriod = claimPeriod
-          failedCurrency = claimCurrency
+          failedToken = claimToken
           failedEmployeeExternalId = claimEmployeeExternalId
           failedSalaryBreakdown = claimSalaryBreakdown
           failedAmount = claimAmount
@@ -743,4 +779,3 @@ template SalaryClaim
           failedAt = now
 
         return (rejectedAllocationCid, failedClaimCid)
-

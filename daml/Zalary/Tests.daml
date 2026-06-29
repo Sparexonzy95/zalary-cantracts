@@ -15,37 +15,76 @@ samplePeriod = PayrollPeriod with
   startsAt = date 2026 Jun 1
   endsAt = date 2026 Jun 30
 
-sampleSalary : SalaryBreakdown
-sampleSalary = SalaryBreakdown with
+usdcxTestnet : Party -> TokenInstrument
+usdcxTestnet instrumentAdmin = TokenInstrument with
+  symbol = "USDCx"
+  instrumentId = "USDCx"
+  instrumentAdmin
+  utilityApiUrl = "https://api.utilities.digitalasset-staging.com"
+  xReserveApiUrl = "https://xreserve-api-testnet.circle.com"
+
+secondaryToken : Party -> TokenInstrument
+secondaryToken instrumentAdmin = TokenInstrument with
+  symbol = "ZUSDx"
+  instrumentId = "ZUSDx"
+  instrumentAdmin
+  utilityApiUrl = "https://api.utilities.digitalasset-staging.com"
+  xReserveApiUrl = "https://xreserve-api-testnet.circle.com"
+
+unsupportedToken : Party -> TokenInstrument
+unsupportedToken instrumentAdmin = TokenInstrument with
+  symbol = "DAIx"
+  instrumentId = "DAIx"
+  instrumentAdmin
+  utilityApiUrl = "https://api.utilities.digitalasset-staging.com"
+  xReserveApiUrl = "https://xreserve-api-testnet.circle.com"
+
+sampleSalary : TokenInstrument -> SalaryBreakdown
+sampleSalary token = SalaryBreakdown with
   grossPay = 1000.0
   allowances = 200.0
   deductions = 100.0
   netPay = 1100.0
-  currency = "USDC"
+  token
 
-secondSalary : SalaryBreakdown
-secondSalary = SalaryBreakdown with
+secondSalary : TokenInstrument -> SalaryBreakdown
+secondSalary token = SalaryBreakdown with
   grossPay = 900.0
   allowances = 100.0
   deductions = 50.0
   netPay = 950.0
-  currency = "USDC"
+  token
 
-setupCompany : Text -> Script (Party, Party, Party, Party, Party, ContractId ZalaryConfig, ContractId Company)
+transferProof : TokenInstrument -> Party -> Party -> Decimal -> Text -> Time -> TokenTransferProof
+transferProof token sender receiver amount transferReference executedAt = TokenTransferProof with
+  token
+  sender
+  receiver
+  amount
+  transferReference
+  transferInstructionCid = Some ("transfer-instruction-" <> transferReference)
+  holdingCid = Some ("holding-" <> transferReference)
+  executedAt
+
+setupCompany
+  : Text
+  -> Script (Party, Party, Party, Party, Party, Party, ContractId ZalaryConfig, ContractId Company)
 setupCompany suffix = script do
   platformAdmin <- allocateParty ("PlatformAdmin-" <> suffix)
   companyAdmin <- allocateParty ("CompanyAdmin-" <> suffix)
   employer <- allocateParty ("EmployerWallet-" <> suffix)
   hr <- allocateParty ("HRWallet-" <> suffix)
   employee <- allocateParty ("EmployeeWallet-" <> suffix)
+  usdcxAdmin <- allocateParty ("USDCxAdmin-" <> suffix)
 
   now <- getTime
+  let token = usdcxTestnet usdcxAdmin
 
   platformConfigCid <- submit platformAdmin do
     createCmd ZalaryConfig with
       platformAdmin
-      supportedStablecoins = ["USDC", "USDT"]
-      defaultStablecoin = "USDC"
+      supportedTokens = [token, secondaryToken usdcxAdmin]
+      defaultToken = token
       isActive = True
       createdAt = now
 
@@ -57,9 +96,9 @@ setupCompany suffix = script do
       adminWallets = [companyAdmin]
       hrWallets = [hr]
       employerWallets = [employer]
-      allowedTokens = ["USDC"]
+      allowedTokens = [token]
 
-  return (platformAdmin, companyAdmin, employer, hr, employee, platformConfigCid, companyCid)
+  return (platformAdmin, companyAdmin, employer, hr, employee, usdcxAdmin, platformConfigCid, companyCid)
 
 createEnrollmentFromCompany
   : ContractId Company
@@ -81,11 +120,10 @@ createVaultFromCompany
   -> Party
   -> Party
   -> Text
-  -> Text
-  -> Text
+  -> TokenInstrument
   -> Int
   -> Script (ContractId PayrollVault)
-createVaultFromCompany companyCid hr employer payrollId suffix payrollCurrency expectedEmployeeCount = script do
+createVaultFromCompany companyCid hr employer payrollId payrollToken expectedEmployeeCount = script do
   now <- getTime
   submit hr do
     exerciseCmd companyCid CreatePayrollVault with
@@ -93,33 +131,49 @@ createVaultFromCompany companyCid hr employer payrollId suffix payrollCurrency e
       employerWallet = employer
       payrollId
       payrollPeriod = samplePeriod
-      payrollCurrency
+      payrollToken
       claimWindowStart = now
       claimWindowEnd = addRelTime now (days 7)
       expectedEmployeeCount
 
-payrollHappyPath : Script ()
-payrollHappyPath = script do
-  (_platformAdmin, _companyAdmin, employer, hr, employee, _platformConfigCid, companyCid) <- setupCompany "HAPPY"
+fundVault
+  : ContractId PayrollVault
+  -> Party
+  -> Party
+  -> TokenInstrument
+  -> Decimal
+  -> Text
+  -> Script (ContractId PayrollVault)
+fundVault vaultCid employer companyAdmin token amount fundingReference = script do
+  now <- getTime
+  (fundedVaultCid, _fundingReceiptCid) <- submit employer do
+    exerciseCmd vaultCid ConfirmFunding with
+      fundingAmount = amount
+      fundingReference
+      fundingProof = Some (transferProof token employer companyAdmin amount fundingReference now)
+  return fundedVaultCid
 
-  enrollmentCid <- createEnrollmentFromCompany companyCid hr employer employee "EMP-HAPPY-001"
-  vaultCid <- createVaultFromCompany companyCid hr employer "PAYROLL-HAPPY-2026-06" "HAPPY" "USDC" 1
+setupClaimReadyPayroll
+  : Text
+  -> Script (Party, Party, Party, Party, Party, TokenInstrument, ContractId PayrollVault, ContractId SalaryAllocation, ContractId SalaryClaim)
+setupClaimReadyPayroll suffix = script do
+  (_platformAdmin, companyAdmin, employer, hr, employee, usdcxAdmin, _platformConfigCid, companyCid) <- setupCompany suffix
+  let token = usdcxTestnet usdcxAdmin
+
+  enrollmentCid <- createEnrollmentFromCompany companyCid hr employer employee ("EMP-" <> suffix)
+  vaultCid <- createVaultFromCompany companyCid hr employer ("PAYROLL-" <> suffix) token 1
 
   (vaultWithAllocationCid, allocationCid) <- submit hr do
     exerciseCmd vaultCid AddSalaryAllocation with
       allocationEmployeeWallet = employee
-      employeeExternalId = "EMP-HAPPY-001"
-      salaryBreakdown = sampleSalary
+      employeeExternalId = "EMP-" <> suffix
+      salaryBreakdown = sampleSalary token
       enrollmentCid
 
   finalizedVaultCid <- submit hr do
     exerciseCmd vaultWithAllocationCid FinalizeAllocations
 
-  (fundedVaultCid, _fundingReceiptCid) <- submit employer do
-    exerciseCmd finalizedVaultCid ConfirmFunding with
-      stableToken = "USDC"
-      fundingAmount = 1100.0
-      fundingReference = "FUND-HAPPY-001"
+  fundedVaultCid <- fundVault finalizedVaultCid employer companyAdmin token 1100.0 ("FUND-" <> suffix)
 
   activeVaultCid <- submit employer do
     exerciseCmd fundedVaultCid ActivatePayroll
@@ -131,10 +185,21 @@ payrollHappyPath = script do
   claimCid <- submit employee do
     exerciseCmd ticketCid RequestSalaryClaim
 
+  return (companyAdmin, employer, hr, employee, usdcxAdmin, token, activeVaultCid, allocationCid, claimCid)
+
+payrollHappyPath : Script ()
+payrollHappyPath = script do
+  (_companyAdmin, employer, _hr, employee, _usdcxAdmin, token, activeVaultCid, _allocationCid, claimCid) <- setupClaimReadyPayroll "HAPPY"
+
+  now <- getTime
+  let settlementReference = "SETTLE-HAPPY-001"
+  let settlementProof = transferProof token employer employee 1100.0 settlementReference now
+
   (_settledVaultCid, _settledAllocationCid, _settlementReceiptCid, _payslipCid, _settledRecordCid) <- submit employer do
     exerciseCmd claimCid ConfirmSalarySettlement with
       payrollVaultCid = activeVaultCid
-      settlementReference = "SETTLE-HAPPY-001"
+      settlementReference
+      settlementProof
 
   return ()
 
@@ -143,7 +208,8 @@ testNormalPayrollHappyPathStillWorks = payrollHappyPath
 
 testPlatformConfigDeactivation : Script ()
 testPlatformConfigDeactivation = script do
-  (platformAdmin, companyAdmin, _employer, _hr, _employee, platformConfigCid, companyCid) <- setupCompany "CONFIG-DEACTIVATE"
+  (platformAdmin, companyAdmin, _employer, _hr, _employee, usdcxAdmin, platformConfigCid, companyCid) <- setupCompany "CONFIG-DEACTIVATE"
+  let token = usdcxTestnet usdcxAdmin
 
   inactiveConfigCid <- submit platformAdmin do
     exerciseCmd platformConfigCid DeactivatePlatformConfig
@@ -152,7 +218,7 @@ testPlatformConfigDeactivation = script do
     exerciseCmd inactiveConfigCid UpdateCompanyAllowedTokens with
       companyCid
       companyAdmin
-      newAllowedTokens = ["USDC", "USDT"]
+      newAllowedTokens = [token, secondaryToken usdcxAdmin]
 
   return ()
 
@@ -162,14 +228,16 @@ testRejectUnsupportedTokenThroughPlatformConfig = script do
   companyAdmin <- allocateParty "CompanyAdmin-UNSUPPORTED-CONFIG"
   employer <- allocateParty "EmployerWallet-UNSUPPORTED-CONFIG"
   hr <- allocateParty "HRWallet-UNSUPPORTED-CONFIG"
+  usdcxAdmin <- allocateParty "USDCxAdmin-UNSUPPORTED-CONFIG"
 
   now <- getTime
+  let token = usdcxTestnet usdcxAdmin
 
   platformConfigCid <- submit platformAdmin do
     createCmd ZalaryConfig with
       platformAdmin
-      supportedStablecoins = ["USDC"]
-      defaultStablecoin = "USDC"
+      supportedTokens = [token]
+      defaultToken = token
       isActive = True
       createdAt = now
 
@@ -181,24 +249,25 @@ testRejectUnsupportedTokenThroughPlatformConfig = script do
       adminWallets = [companyAdmin]
       hrWallets = [hr]
       employerWallets = [employer]
-      allowedTokens = ["USDC", "DAI"]
+      allowedTokens = [token, unsupportedToken usdcxAdmin]
 
   return ()
 
 testCompanyFactoryIsNonconsuming : Script ()
 testCompanyFactoryIsNonconsuming = script do
-  (_platformAdmin, _companyAdmin, employer, hr, employeeA, _platformConfigCid, companyCid) <- setupCompany "FACTORY"
+  (_platformAdmin, _companyAdmin, employer, hr, employeeA, usdcxAdmin, _platformConfigCid, companyCid) <- setupCompany "FACTORY"
   employeeB <- allocateParty "EmployeeWallet-FACTORY-B"
+  let token = usdcxTestnet usdcxAdmin
 
   _enrollmentA <- createEnrollmentFromCompany companyCid hr employer employeeA "EMP-FACTORY-A"
   _enrollmentB <- createEnrollmentFromCompany companyCid hr employer employeeB "EMP-FACTORY-B"
 
-  _vaultCid <- createVaultFromCompany companyCid hr employer "PAYROLL-FACTORY-2026-06" "FACTORY" "USDC" 2
+  _vaultCid <- createVaultFromCompany companyCid hr employer "PAYROLL-FACTORY-2026-06" token 2
   return ()
 
 testRejectUnapprovedHRFactoryUse : Script ()
 testRejectUnapprovedHRFactoryUse = script do
-  (_platformAdmin, _companyAdmin, employer, _hr, employee, _platformConfigCid, companyCid) <- setupCompany "BADHR"
+  (_platformAdmin, _companyAdmin, employer, _hr, employee, _usdcxAdmin, _platformConfigCid, companyCid) <- setupCompany "BADHR"
   fakeHr <- allocateParty "FakeHR-BADHR"
 
   submitMustFail fakeHr do
@@ -212,56 +281,55 @@ testRejectUnapprovedHRFactoryUse = script do
 
 testRejectWrongEnrollment : Script ()
 testRejectWrongEnrollment = script do
-  (_platformAdmin, _companyAdmin, employer, hr, employee, _platformConfigCid, companyCid) <- setupCompany "WRONG-ENROLL"
+  (_platformAdmin, _companyAdmin, employer, hr, employee, usdcxAdmin, _platformConfigCid, companyCid) <- setupCompany "WRONG-ENROLL"
   wrongEmployee <- allocateParty "WrongEmployee-WRONG-ENROLL"
+  let token = usdcxTestnet usdcxAdmin
 
   wrongEnrollmentCid <- createEnrollmentFromCompany companyCid hr employer wrongEmployee "EMP-WRONG"
-  vaultCid <- createVaultFromCompany companyCid hr employer "PAYROLL-WRONG-ENROLLMENT" "WRONG-ENROLL" "USDC" 1
+  vaultCid <- createVaultFromCompany companyCid hr employer "PAYROLL-WRONG-ENROLLMENT" token 1
 
   submitMustFail hr do
     exerciseCmd vaultCid AddSalaryAllocation with
       allocationEmployeeWallet = employee
       employeeExternalId = "EMP-WRONG"
-      salaryBreakdown = sampleSalary
+      salaryBreakdown = sampleSalary token
       enrollmentCid = wrongEnrollmentCid
 
   return ()
 
 testRejectFundingBeforeFinalization : Script ()
 testRejectFundingBeforeFinalization = script do
-  (_platformAdmin, _companyAdmin, employer, hr, _employee, _platformConfigCid, companyCid) <- setupCompany "FUND-BEFORE-FINAL"
-  vaultCid <- createVaultFromCompany companyCid hr employer "PAYROLL-NOT-FINALIZED" "FUND-BEFORE-FINAL" "USDC" 1
+  (_platformAdmin, _companyAdmin, employer, hr, _employee, usdcxAdmin, _platformConfigCid, companyCid) <- setupCompany "FUND-BEFORE-FINAL"
+  let token = usdcxTestnet usdcxAdmin
+  vaultCid <- createVaultFromCompany companyCid hr employer "PAYROLL-NOT-FINALIZED" token 1
 
   submitMustFail employer do
     exerciseCmd vaultCid ConfirmFunding with
-      stableToken = "USDC"
       fundingAmount = 1100.0
       fundingReference = "FUND-SHOULD-FAIL"
+      fundingProof = None
 
   return ()
 
 testRejectEarlyLeftoverWithdrawal : Script ()
 testRejectEarlyLeftoverWithdrawal = script do
-  (_platformAdmin, _companyAdmin, employer, hr, employee, _platformConfigCid, companyCid) <- setupCompany "LEFTOVER"
+  (_platformAdmin, companyAdmin, employer, hr, employee, usdcxAdmin, _platformConfigCid, companyCid) <- setupCompany "LEFTOVER"
+  let token = usdcxTestnet usdcxAdmin
 
   enrollmentCid <- createEnrollmentFromCompany companyCid hr employer employee "EMP-LEFTOVER"
-  vaultCid <- createVaultFromCompany companyCid hr employer "PAYROLL-LEFTOVER" "LEFTOVER" "USDC" 1
+  vaultCid <- createVaultFromCompany companyCid hr employer "PAYROLL-LEFTOVER" token 1
 
   (vaultWithAllocationCid, _allocationCid) <- submit hr do
     exerciseCmd vaultCid AddSalaryAllocation with
       allocationEmployeeWallet = employee
       employeeExternalId = "EMP-LEFTOVER"
-      salaryBreakdown = sampleSalary
+      salaryBreakdown = sampleSalary token
       enrollmentCid
 
   finalizedVaultCid <- submit hr do
     exerciseCmd vaultWithAllocationCid FinalizeAllocations
 
-  (fundedVaultCid, _fundingReceiptCid) <- submit employer do
-    exerciseCmd finalizedVaultCid ConfirmFunding with
-      stableToken = "USDC"
-      fundingAmount = 1200.0
-      fundingReference = "FUND-LEFTOVER"
+  fundedVaultCid <- fundVault finalizedVaultCid employer companyAdmin token 1200.0 "FUND-LEFTOVER"
 
   activeVaultCid <- submit employer do
     exerciseCmd fundedVaultCid ActivatePayroll
@@ -274,60 +342,82 @@ testRejectEarlyLeftoverWithdrawal = script do
 
 testRejectDuplicateAllocation : Script ()
 testRejectDuplicateAllocation = script do
-  (_platformAdmin, _companyAdmin, employer, hr, employee, _platformConfigCid, companyCid) <- setupCompany "DUPLICATE"
+  (_platformAdmin, _companyAdmin, employer, hr, employee, usdcxAdmin, _platformConfigCid, companyCid) <- setupCompany "DUPLICATE"
+  let token = usdcxTestnet usdcxAdmin
 
   enrollmentCid <- createEnrollmentFromCompany companyCid hr employer employee "EMP-DUPLICATE"
-  vaultCid <- createVaultFromCompany companyCid hr employer "PAYROLL-DUPLICATE" "DUPLICATE" "USDC" 2
+  vaultCid <- createVaultFromCompany companyCid hr employer "PAYROLL-DUPLICATE" token 2
 
   (vaultWithAllocationCid, _allocationCid) <- submit hr do
     exerciseCmd vaultCid AddSalaryAllocation with
       allocationEmployeeWallet = employee
       employeeExternalId = "EMP-DUPLICATE"
-      salaryBreakdown = sampleSalary
+      salaryBreakdown = sampleSalary token
       enrollmentCid
 
   submitMustFail hr do
     exerciseCmd vaultWithAllocationCid AddSalaryAllocation with
       allocationEmployeeWallet = employee
       employeeExternalId = "EMP-DUPLICATE-2"
-      salaryBreakdown = secondSalary
+      salaryBreakdown = secondSalary token
       enrollmentCid
 
   return ()
 
 testRejectTokenNotAllowedForCompany : Script ()
 testRejectTokenNotAllowedForCompany = script do
-  (_platformAdmin, _companyAdmin, employer, hr, _employee, _platformConfigCid, companyCid) <- setupCompany "TOKEN-BLOCK"
+  (_platformAdmin, _companyAdmin, employer, hr, _employee, usdcxAdmin, _platformConfigCid, companyCid) <- setupCompany "TOKEN-BLOCK"
 
   submitMustFail hr do
     exerciseCmd companyCid CreatePayrollVault with
       hrWallet = hr
       employerWallet = employer
-      payrollId = "PAYROLL-UNSUPPORTED-USDT"
+      payrollId = "PAYROLL-UNSUPPORTED-DAIX"
       payrollPeriod = samplePeriod
-      payrollCurrency = "USDT"
+      payrollToken = unsupportedToken usdcxAdmin
       claimWindowStart = time (date 2026 Jun 1) 0 0 0
       claimWindowEnd = time (date 2026 Jun 8) 0 0 0
       expectedEmployeeCount = 1
 
   return ()
 
-testPlatformCanAssignSecondStablecoin : Script ()
-testPlatformCanAssignSecondStablecoin = script do
-  (platformAdmin, companyAdmin, employer, hr, _employee, platformConfigCid, companyCid) <- setupCompany "TOKEN-ALLOW"
+testPlatformCanAssignSecondToken : Script ()
+testPlatformCanAssignSecondToken = script do
+  (platformAdmin, companyAdmin, employer, hr, _employee, usdcxAdmin, platformConfigCid, companyCid) <- setupCompany "TOKEN-ALLOW"
+  let token = usdcxTestnet usdcxAdmin
+  let secondToken = secondaryToken usdcxAdmin
 
   updatedCompanyCid <- submitMulti [platformAdmin, companyAdmin] [] do
     exerciseCmd platformConfigCid UpdateCompanyAllowedTokens with
       companyCid
       companyAdmin
-      newAllowedTokens = ["USDC", "USDT"]
+      newAllowedTokens = [token, secondToken]
 
-  _vaultCid <- createVaultFromCompany updatedCompanyCid hr employer "PAYROLL-USDT-ALLOWED" "TOKEN-ALLOW" "USDT" 1
+  _vaultCid <- createVaultFromCompany updatedCompanyCid hr employer "PAYROLL-SECOND-TOKEN-ALLOWED" secondToken 1
+  return ()
+
+testRejectPayrollTokenMismatch : Script ()
+testRejectPayrollTokenMismatch = script do
+  (_platformAdmin, _companyAdmin, employer, hr, employee, usdcxAdmin, _platformConfigCid, companyCid) <- setupCompany "PAYROLL-TOKEN-MISMATCH"
+  let token = usdcxTestnet usdcxAdmin
+  let wrongToken = unsupportedToken usdcxAdmin
+
+  enrollmentCid <- createEnrollmentFromCompany companyCid hr employer employee "EMP-PAYROLL-TOKEN-MISMATCH"
+  vaultCid <- createVaultFromCompany companyCid hr employer "PAYROLL-TOKEN-MISMATCH" token 1
+
+  submitMustFail hr do
+    exerciseCmd vaultCid AddSalaryAllocation with
+      allocationEmployeeWallet = employee
+      employeeExternalId = "EMP-PAYROLL-TOKEN-MISMATCH"
+      salaryBreakdown = sampleSalary wrongToken
+      enrollmentCid
+
   return ()
 
 testRejectClaimTicketAfterWindowEnd : Script ()
 testRejectClaimTicketAfterWindowEnd = script do
-  (_platformAdmin, _companyAdmin, employer, hr, employee, _platformConfigCid, companyCid) <- setupCompany "LATE-TICKET"
+  (_platformAdmin, companyAdmin, employer, hr, employee, usdcxAdmin, _platformConfigCid, companyCid) <- setupCompany "LATE-TICKET"
+  let token = usdcxTestnet usdcxAdmin
 
   enrollmentCid <- createEnrollmentFromCompany companyCid hr employer employee "EMP-LATE-TICKET"
   now <- getTime
@@ -338,7 +428,7 @@ testRejectClaimTicketAfterWindowEnd = script do
       employerWallet = employer
       payrollId = "PAYROLL-LATE-TICKET"
       payrollPeriod = samplePeriod
-      payrollCurrency = "USDC"
+      payrollToken = token
       claimWindowStart = now
       claimWindowEnd = addRelTime now (days 1)
       expectedEmployeeCount = 1
@@ -347,17 +437,13 @@ testRejectClaimTicketAfterWindowEnd = script do
     exerciseCmd vaultCid AddSalaryAllocation with
       allocationEmployeeWallet = employee
       employeeExternalId = "EMP-LATE-TICKET"
-      salaryBreakdown = sampleSalary
+      salaryBreakdown = sampleSalary token
       enrollmentCid
 
   finalizedVaultCid <- submit hr do
     exerciseCmd vaultWithAllocationCid FinalizeAllocations
 
-  (fundedVaultCid, _fundingReceiptCid) <- submit employer do
-    exerciseCmd finalizedVaultCid ConfirmFunding with
-      stableToken = "USDC"
-      fundingAmount = 1100.0
-      fundingReference = "FUND-LATE-TICKET"
+  fundedVaultCid <- fundVault finalizedVaultCid employer companyAdmin token 1100.0 "FUND-LATE-TICKET"
 
   activeVaultCid <- submit employer do
     exerciseCmd fundedVaultCid ActivatePayroll
@@ -372,31 +458,29 @@ testRejectClaimTicketAfterWindowEnd = script do
 
 testDirectSettlementHelperRequiresValidAllocation : Script ()
 testDirectSettlementHelperRequiresValidAllocation = script do
-  (_platformAdmin, companyAdmin, employer, hr, employee, _platformConfigCid, companyCid) <- setupCompany "DIRECT-SETTLEMENT"
+  (_platformAdmin, companyAdmin, employer, hr, employee, usdcxAdmin, _platformConfigCid, companyCid) <- setupCompany "DIRECT-SETTLEMENT"
+  let token = usdcxTestnet usdcxAdmin
 
   enrollmentCid <- createEnrollmentFromCompany companyCid hr employer employee "EMP-DIRECT-SETTLEMENT"
-  vaultCid <- createVaultFromCompany companyCid hr employer "PAYROLL-DIRECT-SETTLEMENT" "DIRECT-SETTLEMENT" "USDC" 1
+  vaultCid <- createVaultFromCompany companyCid hr employer "PAYROLL-DIRECT-SETTLEMENT" token 1
 
   (vaultWithAllocationCid, allocationCid) <- submit hr do
     exerciseCmd vaultCid AddSalaryAllocation with
       allocationEmployeeWallet = employee
       employeeExternalId = "EMP-DIRECT-SETTLEMENT"
-      salaryBreakdown = sampleSalary
+      salaryBreakdown = sampleSalary token
       enrollmentCid
 
   finalizedVaultCid <- submit hr do
     exerciseCmd vaultWithAllocationCid FinalizeAllocations
 
-  (fundedVaultCid, _fundingReceiptCid) <- submit employer do
-    exerciseCmd finalizedVaultCid ConfirmFunding with
-      stableToken = "USDC"
-      fundingAmount = 1100.0
-      fundingReference = "FUND-DIRECT-SETTLEMENT"
+  fundedVaultCid <- fundVault finalizedVaultCid employer companyAdmin token 1100.0 "FUND-DIRECT-SETTLEMENT"
 
   activeVaultCid <- submit employer do
     exerciseCmd fundedVaultCid ActivatePayroll
 
   now <- getTime
+  let settlementProof = transferProof token employer employee 1100.0 "SETTLE-DIRECT-SETTLEMENT" now
 
   settlementAuthCid <- submitMulti [employee, employer] [] do
     createCmd ClaimActionAuthorization with
@@ -406,7 +490,7 @@ testDirectSettlementHelperRequiresValidAllocation = script do
       authCompanyId = "ZAL-DIRECT-SETTLEMENT"
       authPayrollId = "PAYROLL-DIRECT-SETTLEMENT"
       authPeriod = samplePeriod
-      authCurrency = "USDC"
+      authToken = token
       authEmployeeExternalId = "EMP-DIRECT-SETTLEMENT"
       authAmount = 1100.0
       authSourceAllocationCid = allocationCid
@@ -419,6 +503,52 @@ testDirectSettlementHelperRequiresValidAllocation = script do
       settlementEmployeeWallet = employee
       settlementEmployeeExternalId = "EMP-DIRECT-SETTLEMENT"
       settlementAmount = 1100.0
+      settlementProof
       settlementAuthCid
+
+  return ()
+
+testRejectSettlementProofWrongToken : Script ()
+testRejectSettlementProofWrongToken = script do
+  (_companyAdmin, employer, _hr, employee, usdcxAdmin, _token, activeVaultCid, _allocationCid, claimCid) <- setupClaimReadyPayroll "WRONG-PROOF-TOKEN"
+  now <- getTime
+  let settlementReference = "SETTLE-WRONG-PROOF-TOKEN"
+  let settlementProof = transferProof (unsupportedToken usdcxAdmin) employer employee 1100.0 settlementReference now
+
+  submitMustFail employer do
+    exerciseCmd claimCid ConfirmSalarySettlement with
+      payrollVaultCid = activeVaultCid
+      settlementReference
+      settlementProof
+
+  return ()
+
+testRejectSettlementProofWrongReceiver : Script ()
+testRejectSettlementProofWrongReceiver = script do
+  (companyAdmin, employer, _hr, _employee, _usdcxAdmin, token, activeVaultCid, _allocationCid, claimCid) <- setupClaimReadyPayroll "WRONG-PROOF-RECEIVER"
+  now <- getTime
+  let settlementReference = "SETTLE-WRONG-PROOF-RECEIVER"
+  let settlementProof = transferProof token employer companyAdmin 1100.0 settlementReference now
+
+  submitMustFail employer do
+    exerciseCmd claimCid ConfirmSalarySettlement with
+      payrollVaultCid = activeVaultCid
+      settlementReference
+      settlementProof
+
+  return ()
+
+testRejectSettlementProofWrongAmount : Script ()
+testRejectSettlementProofWrongAmount = script do
+  (_companyAdmin, employer, _hr, employee, _usdcxAdmin, token, activeVaultCid, _allocationCid, claimCid) <- setupClaimReadyPayroll "WRONG-PROOF-AMOUNT"
+  now <- getTime
+  let settlementReference = "SETTLE-WRONG-PROOF-AMOUNT"
+  let settlementProof = transferProof token employer employee 1000.0 settlementReference now
+
+  submitMustFail employer do
+    exerciseCmd claimCid ConfirmSalarySettlement with
+      payrollVaultCid = activeVaultCid
+      settlementReference
+      settlementProof
 
   return ()

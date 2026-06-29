@@ -19,7 +19,7 @@ template Company
     adminWallets : [Party]
     hrWallets : [Party]
     employerWallets : [Party]
-    allowedTokens : [Text]
+    allowedTokens : [TokenInstrument]
     createdAt : Time
   where
     signatory platformAdmin, companyAdmin
@@ -32,9 +32,9 @@ template Company
         && isUnique adminWallets
         && isUnique hrWallets
         && isUnique employerWallets
-        && isUnique allowedTokens
+        && tokensUnique allowedTokens
         && length allowedTokens > 0
-        && all nonEmptyText allowedTokens
+        && all validTokenInstrument allowedTokens
 
     key (platformAdmin, companyId) : (Party, Text)
     maintainer key._1
@@ -108,7 +108,7 @@ template Company
         employerWallet : Party
         payrollId : Text
         payrollPeriod : PayrollPeriod
-        payrollCurrency : Text
+        payrollToken : TokenInstrument
         claimWindowStart : Time
         claimWindowEnd : Time
         expectedEmployeeCount : Int
@@ -116,7 +116,7 @@ template Company
       do
         assertMsg "HR wallet is not approved for this company" (elem hrWallet hrWallets)
         assertMsg "Employer wallet is not approved for this company" (elem employerWallet employerWallets)
-        assertMsg "Payroll token is not allowed for this company" (elem payrollCurrency allowedTokens)
+        assertMsg "Payroll token is not allowed for this company" (tokenInList payrollToken allowedTokens)
         assertMsg "Payroll ID is required" (nonEmptyText payrollId)
         assertMsg "Payroll period is invalid" (validPayrollPeriod payrollPeriod)
         assertMsg "Claim window is invalid" (claimWindowStart < claimWindowEnd)
@@ -129,7 +129,7 @@ template Company
           companyId
           payrollId
           payrollPeriod
-          payrollCurrency
+          payrollToken
           claimWindowStart
           claimWindowEnd
           expectedEmployeeCount

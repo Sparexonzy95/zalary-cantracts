@@ -10,9 +10,10 @@ template FundingReceipt
     fundingCompanyId : Text
     fundingPayrollId : Text
     fundingPeriod : PayrollPeriod
-    fundingCurrency : Text
+    fundingToken : TokenInstrument
     fundingAmount : Decimal
     fundingReference : Text
+    fundingProof : Optional TokenTransferProof
     companyAdmin : Party
     fundedAt : Time
   where
@@ -22,9 +23,18 @@ template FundingReceipt
       fundingAmount > 0.0
         && nonEmptyText fundingCompanyId
         && nonEmptyText fundingPayrollId
-        && nonEmptyText fundingCurrency
+        && validTokenInstrument fundingToken
         && nonEmptyText fundingReference
         && validPayrollPeriod fundingPeriod
+        && (case fundingProof of
+              None -> True
+              Some proof ->
+                validTokenTransferProof proof
+                  && sameTokenInstrument proof.token fundingToken
+                  && proof.sender == fundingEmployerWallet
+                  && proof.receiver == companyAdmin
+                  && proof.amount == fundingAmount
+                  && proof.transferReference == fundingReference)
 
 template PayrollCancellationReceipt
   with
@@ -53,7 +63,7 @@ template LeftoverWithdrawalReceipt
     leftoverCompanyId : Text
     leftoverPayrollId : Text
     leftoverPeriod : PayrollPeriod
-    leftoverCurrency : Text
+    leftoverToken : TokenInstrument
     leftoverAmount : Decimal
     withdrawalReference : Text
     companyAdmin : Party
@@ -65,7 +75,7 @@ template LeftoverWithdrawalReceipt
       leftoverAmount > 0.0
         && nonEmptyText leftoverCompanyId
         && nonEmptyText leftoverPayrollId
-        && nonEmptyText leftoverCurrency
+        && validTokenInstrument leftoverToken
         && nonEmptyText withdrawalReference
         && validPayrollPeriod leftoverPeriod
 
@@ -77,11 +87,12 @@ template SettlementReceipt
     receiptCompanyId : Text
     receiptPayrollId : Text
     receiptPeriod : PayrollPeriod
-    receiptCurrency : Text
+    receiptToken : TokenInstrument
     receiptEmployeeExternalId : Text
     receiptSalaryBreakdown : SalaryBreakdown
     receiptAmount : Decimal
     settlementReference : Text
+    settlementProof : TokenTransferProof
     companyAdmin : Party
     settledAt : Time
   where
@@ -91,13 +102,19 @@ template SettlementReceipt
       receiptAmount > 0.0
         && nonEmptyText receiptCompanyId
         && nonEmptyText receiptPayrollId
-        && nonEmptyText receiptCurrency
+        && validTokenInstrument receiptToken
         && nonEmptyText receiptEmployeeExternalId
         && nonEmptyText settlementReference
         && validPayrollPeriod receiptPeriod
         && validSalaryBreakdown receiptSalaryBreakdown
-        && receiptSalaryBreakdown.currency == receiptCurrency
+        && sameTokenInstrument receiptSalaryBreakdown.token receiptToken
         && receiptSalaryBreakdown.netPay == receiptAmount
+        && validTokenTransferProof settlementProof
+        && sameTokenInstrument settlementProof.token receiptToken
+        && settlementProof.sender == receiptEmployerWallet
+        && settlementProof.receiver == receiptEmployeeWallet
+        && settlementProof.amount == receiptAmount
+        && settlementProof.transferReference == settlementReference
 
 template Payslip
   with
@@ -107,9 +124,10 @@ template Payslip
     payslipCompanyId : Text
     payslipPayrollId : Text
     payslipPeriod : PayrollPeriod
-    payslipCurrency : Text
+    payslipToken : TokenInstrument
     payslipEmployeeExternalId : Text
     payslipSalaryBreakdown : SalaryBreakdown
+    settlementProof : TokenTransferProof
     companyAdmin : Party
     issuedAt : Time
   where
@@ -118,11 +136,16 @@ template Payslip
     ensure
       nonEmptyText payslipCompanyId
         && nonEmptyText payslipPayrollId
-        && nonEmptyText payslipCurrency
+        && validTokenInstrument payslipToken
         && nonEmptyText payslipEmployeeExternalId
         && validPayrollPeriod payslipPeriod
         && validSalaryBreakdown payslipSalaryBreakdown
-        && payslipSalaryBreakdown.currency == payslipCurrency
+        && sameTokenInstrument payslipSalaryBreakdown.token payslipToken
+        && validTokenTransferProof settlementProof
+        && sameTokenInstrument settlementProof.token payslipToken
+        && settlementProof.sender == payslipEmployerWallet
+        && settlementProof.receiver == payslipEmployeeWallet
+        && settlementProof.amount == payslipSalaryBreakdown.netPay
 
 template SettledSalaryRecord
   with
@@ -132,10 +155,11 @@ template SettledSalaryRecord
     settledRecordCompanyId : Text
     settledRecordPayrollId : Text
     settledRecordPeriod : PayrollPeriod
-    settledRecordCurrency : Text
+    settledRecordToken : TokenInstrument
     settledRecordEmployeeExternalId : Text
     settledRecordAmount : Decimal
     settledRecordReference : Text
+    settlementProof : TokenTransferProof
     companyAdmin : Party
     settledRecordAt : Time
   where
@@ -145,10 +169,16 @@ template SettledSalaryRecord
       settledRecordAmount > 0.0
         && nonEmptyText settledRecordCompanyId
         && nonEmptyText settledRecordPayrollId
-        && nonEmptyText settledRecordCurrency
+        && validTokenInstrument settledRecordToken
         && nonEmptyText settledRecordEmployeeExternalId
         && nonEmptyText settledRecordReference
         && validPayrollPeriod settledRecordPeriod
+        && validTokenTransferProof settlementProof
+        && sameTokenInstrument settlementProof.token settledRecordToken
+        && settlementProof.sender == settledRecordEmployerWallet
+        && settlementProof.receiver == settledRecordEmployeeWallet
+        && settlementProof.amount == settledRecordAmount
+        && settlementProof.transferReference == settledRecordReference
 
 template FailedSalaryClaim
   with
@@ -158,7 +188,7 @@ template FailedSalaryClaim
     failedCompanyId : Text
     failedPayrollId : Text
     failedPeriod : PayrollPeriod
-    failedCurrency : Text
+    failedToken : TokenInstrument
     failedEmployeeExternalId : Text
     failedSalaryBreakdown : SalaryBreakdown
     failedAmount : Decimal
@@ -172,11 +202,10 @@ template FailedSalaryClaim
       failedAmount > 0.0
         && nonEmptyText failedCompanyId
         && nonEmptyText failedPayrollId
-        && nonEmptyText failedCurrency
+        && validTokenInstrument failedToken
         && nonEmptyText failedEmployeeExternalId
         && nonEmptyText failureReason
         && validPayrollPeriod failedPeriod
         && validSalaryBreakdown failedSalaryBreakdown
-        && failedSalaryBreakdown.currency == failedCurrency
+        && sameTokenInstrument failedSalaryBreakdown.token failedToken
         && failedSalaryBreakdown.netPay == failedAmount
-
