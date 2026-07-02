@@ -8,6 +8,7 @@ import Zalary.Platform
 import Zalary.Company
 import Zalary.Enrollment
 import Zalary.Payroll
+import Zalary.Sandbox.ZUSD
 
 samplePeriod : PayrollPeriod
 samplePeriod = PayrollPeriod with
@@ -205,6 +206,170 @@ payrollHappyPath = script do
 
 testNormalPayrollHappyPathStillWorks : Script ()
 testNormalPayrollHappyPathStillWorks = payrollHappyPath
+
+setupZUSDIssuer : Text -> Script (Party, Party, Party, ContractId ZUSDIssuer)
+setupZUSDIssuer suffix = script do
+  issuer <- allocateParty ("ZUSDIssuer-" <> suffix)
+  employer <- allocateParty ("ZUSDEmployer-" <> suffix)
+  employee <- allocateParty ("ZUSDEmployee-" <> suffix)
+  now <- getTime
+
+  issuerCid <- submit issuer do
+    createCmd ZUSDIssuer with
+      issuer
+      symbol = "ZUSD"
+      environment = "sandbox"
+      observers = []
+      createdAt = now
+
+  return (issuer, employer, employee, issuerCid)
+
+testZUSDMintCreatesHoldingAndGrant : Script ()
+testZUSDMintCreatesHoldingAndGrant = script do
+  (issuer, employer, _employee, issuerCid) <- setupZUSDIssuer "MINT"
+
+  (_holdingCid, _grantCid) <- submit issuer do
+    exerciseCmd issuerCid MintZUSD with
+      recipient = employer
+      amount = 5000.0
+      requestId = "faucet-request-mint"
+      reference = "faucet-reference-mint"
+      environment = "sandbox"
+
+  return ()
+
+testZUSDMintRejectsZeroOrNegativeAmount : Script ()
+testZUSDMintRejectsZeroOrNegativeAmount = script do
+  (issuer, employer, _employee, issuerCid) <- setupZUSDIssuer "MINT-REJECT"
+
+  submitMustFail issuer do
+    exerciseCmd issuerCid MintZUSD with
+      recipient = employer
+      amount = 0.0
+      requestId = "faucet-request-zero"
+      reference = "faucet-reference-zero"
+      environment = "sandbox"
+
+  submitMustFail issuer do
+    exerciseCmd issuerCid MintZUSD with
+      recipient = employer
+      amount = -1.0
+      requestId = "faucet-request-negative"
+      reference = "faucet-reference-negative"
+      environment = "sandbox"
+
+  return ()
+
+testZUSDTransferExactAmount : Script ()
+testZUSDTransferExactAmount = script do
+  (issuer, employer, employee, issuerCid) <- setupZUSDIssuer "TRANSFER-EXACT"
+
+  (holdingCid, _grantCid) <- submit issuer do
+    exerciseCmd issuerCid MintZUSD with
+      recipient = employer
+      amount = 100.0
+      requestId = "faucet-request-transfer-exact"
+      reference = "faucet-reference-transfer-exact"
+      environment = "sandbox"
+
+  (_receiverCid, changeCid) <- submit employer do
+    exerciseCmd holdingCid TransferZUSD with
+      receiver = employee
+      amount = 100.0
+      reference = "zalary-zusd-exact"
+
+  case changeCid of
+    None -> return ()
+    Some _ -> abort "Exact ZUSD transfer should not create change"
+
+testZUSDTransferPartialCreatesReceiverAndChange : Script ()
+testZUSDTransferPartialCreatesReceiverAndChange = script do
+  (issuer, employer, employee, issuerCid) <- setupZUSDIssuer "TRANSFER-PARTIAL"
+
+  (holdingCid, _grantCid) <- submit issuer do
+    exerciseCmd issuerCid MintZUSD with
+      recipient = employer
+      amount = 100.0
+      requestId = "faucet-request-transfer-partial"
+      reference = "faucet-reference-transfer-partial"
+      environment = "sandbox"
+
+  (_receiverCid, changeCid) <- submit employer do
+    exerciseCmd holdingCid TransferZUSD with
+      receiver = employee
+      amount = 40.0
+      reference = "zalary-zusd-partial"
+
+  case changeCid of
+    Some _ -> return ()
+    None -> abort "Partial ZUSD transfer should create a change holding"
+
+testZUSDTransferRejectsInsufficientBalance : Script ()
+testZUSDTransferRejectsInsufficientBalance = script do
+  (issuer, employer, employee, issuerCid) <- setupZUSDIssuer "TRANSFER-INSUFFICIENT"
+
+  (holdingCid, _grantCid) <- submit issuer do
+    exerciseCmd issuerCid MintZUSD with
+      recipient = employer
+      amount = 100.0
+      requestId = "faucet-request-transfer-insufficient"
+      reference = "faucet-reference-transfer-insufficient"
+      environment = "sandbox"
+
+  submitMustFail employer do
+    exerciseCmd holdingCid TransferZUSD with
+      receiver = employee
+      amount = 101.0
+      reference = "zalary-zusd-insufficient"
+
+  return ()
+
+testZUSDTransferRejectsZeroOrNegativeAmount : Script ()
+testZUSDTransferRejectsZeroOrNegativeAmount = script do
+  (issuer, employer, employee, issuerCid) <- setupZUSDIssuer "TRANSFER-REJECT"
+
+  (holdingCid, _grantCid) <- submit issuer do
+    exerciseCmd issuerCid MintZUSD with
+      recipient = employer
+      amount = 100.0
+      requestId = "faucet-request-transfer-reject"
+      reference = "faucet-reference-transfer-reject"
+      environment = "sandbox"
+
+  submitMustFail employer do
+    exerciseCmd holdingCid TransferZUSD with
+      receiver = employee
+      amount = 0.0
+      reference = "zalary-zusd-zero"
+
+  submitMustFail employer do
+    exerciseCmd holdingCid TransferZUSD with
+      receiver = employee
+      amount = -1.0
+      reference = "zalary-zusd-negative"
+
+  return ()
+
+testZUSDNonOwnerCannotTransfer : Script ()
+testZUSDNonOwnerCannotTransfer = script do
+  (issuer, employer, employee, issuerCid) <- setupZUSDIssuer "NONOWNER"
+  outsider <- allocateParty "ZUSDOutsider-NONOWNER"
+
+  (holdingCid, _grantCid) <- submit issuer do
+    exerciseCmd issuerCid MintZUSD with
+      recipient = employer
+      amount = 100.0
+      requestId = "faucet-request-nonowner"
+      reference = "faucet-reference-nonowner"
+      environment = "sandbox"
+
+  submitMustFail outsider do
+    exerciseCmd holdingCid TransferZUSD with
+      receiver = employee
+      amount = 1.0
+      reference = "zalary-zusd-nonowner"
+
+  return ()
 
 testPlatformConfigDeactivation : Script ()
 testPlatformConfigDeactivation = script do

@@ -1,0 +1,176 @@
+module Zalary.Sandbox.ZUSD where
+
+import DA.Time
+import Zalary.Types
+
+zusdSymbol : Text
+zusdSymbol = "ZUSD"
+
+template ZUSDHolding
+  with
+    issuer : Party
+    owner : Party
+    amount : Decimal
+    symbol : Text
+    reference : Text
+    observers : [Party]
+  where
+    signatory issuer
+    observer owner, observers
+
+    ensure
+      amount > 0.0
+        && symbol == zusdSymbol
+        && nonEmptyText reference
+
+    choice TransferZUSD : (ContractId ZUSDHolding, Optional (ContractId ZUSDHolding))
+      with
+        receiver : Party
+        amount : Decimal
+        reference : Text
+      controller owner
+      do
+        assertMsg "ZUSD transfer amount must be positive" (amount > 0.0)
+        assertMsg "ZUSD transfer amount exceeds holding amount" (amount <= this.amount)
+        assertMsg "ZUSD transfer reference is required" (nonEmptyText reference)
+
+        receiverCid <- create this with
+          owner = receiver
+          amount = amount
+          reference = reference
+
+        let changeAmount = this.amount - amount
+        changeCid <- if changeAmount > 0.0
+          then do
+            cid <- create this with
+              amount = changeAmount
+              reference = reference
+            return (Some cid)
+          else return None
+
+        return (receiverCid, changeCid)
+
+template ZUSDFaucetGrant
+  with
+    issuer : Party
+    recipient : Party
+    amount : Decimal
+    symbol : Text
+    requestId : Text
+    reference : Text
+    environment : Text
+    holdingCid : ContractId ZUSDHolding
+    observers : [Party]
+    grantedAt : Time
+  where
+    signatory issuer
+    observer recipient, observers
+
+    ensure
+      amount > 0.0
+        && symbol == zusdSymbol
+        && nonEmptyText requestId
+        && nonEmptyText reference
+        && nonEmptyText environment
+
+template ZUSDFaucetConfig
+  with
+    faucetAdmin : Party
+    issuer : Party
+    environment : Text
+    enabled : Bool
+    maxGrantAmount : Decimal
+    dailyLimit : Decimal
+    monthlyLimit : Decimal
+    observers : [Party]
+    createdAt : Time
+  where
+    signatory faucetAdmin
+    observer issuer, observers
+
+    ensure
+      nonEmptyText environment
+        && maxGrantAmount > 0.0
+        && dailyLimit > 0.0
+        && monthlyLimit > 0.0
+        && maxGrantAmount <= dailyLimit
+        && dailyLimit <= monthlyLimit
+
+    choice UpdateZUSDFaucetLimits : ContractId ZUSDFaucetConfig
+      with
+        newMaxGrantAmount : Decimal
+        newDailyLimit : Decimal
+        newMonthlyLimit : Decimal
+      controller faucetAdmin
+      do
+        assertMsg "ZUSD faucet max grant must be positive" (newMaxGrantAmount > 0.0)
+        assertMsg "ZUSD faucet daily limit must be positive" (newDailyLimit > 0.0)
+        assertMsg "ZUSD faucet monthly limit must be positive" (newMonthlyLimit > 0.0)
+        assertMsg "ZUSD faucet max grant cannot exceed daily limit" (newMaxGrantAmount <= newDailyLimit)
+        assertMsg "ZUSD faucet daily limit cannot exceed monthly limit" (newDailyLimit <= newMonthlyLimit)
+        create this with
+          maxGrantAmount = newMaxGrantAmount
+          dailyLimit = newDailyLimit
+          monthlyLimit = newMonthlyLimit
+
+    choice DisableZUSDFaucet : ContractId ZUSDFaucetConfig
+      controller faucetAdmin
+      do
+        create this with enabled = False
+
+    choice EnableZUSDFaucet : ContractId ZUSDFaucetConfig
+      controller faucetAdmin
+      do
+        create this with enabled = True
+
+template ZUSDIssuer
+  with
+    issuer : Party
+    symbol : Text
+    environment : Text
+    observers : [Party]
+    createdAt : Time
+  where
+    signatory issuer
+    observer observers
+
+    ensure
+      symbol == zusdSymbol
+        && nonEmptyText environment
+
+    choice MintZUSD : (ContractId ZUSDHolding, ContractId ZUSDFaucetGrant)
+      with
+        recipient : Party
+        amount : Decimal
+        requestId : Text
+        reference : Text
+        environment : Text
+      controller issuer
+      do
+        assertMsg "ZUSD mint amount must be positive" (amount > 0.0)
+        assertMsg "ZUSD faucet request ID is required" (nonEmptyText requestId)
+        assertMsg "ZUSD faucet reference is required" (nonEmptyText reference)
+        assertMsg "ZUSD faucet environment mismatch" (environment == this.environment)
+
+        now <- getTime
+        holdingCid <- create ZUSDHolding with
+          issuer
+          owner = recipient
+          amount
+          symbol
+          reference
+          observers = this.observers
+
+        grantCid <- create ZUSDFaucetGrant with
+          issuer
+          recipient
+          amount
+          symbol
+          requestId
+          reference
+          environment
+          holdingCid
+          observers = this.observers
+          grantedAt = now
+
+        return (holdingCid, grantCid)

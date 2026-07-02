@@ -87,6 +87,7 @@ daml/Zalary
 |-- Enrollment.daml
 |-- Payroll.daml
 |-- Platform.daml
+|-- Sandbox/ZUSD.daml
 |-- Tests.daml
 `-- Types.daml
 ```
@@ -218,6 +219,17 @@ Important templates include:
 
 These contracts make payroll actions traceable and auditable for the entitled parties.
 
+### `Zalary.Sandbox.ZUSD`
+
+Defines a Daml-only sandbox settlement token for local/devnet testing:
+
+- `ZUSDIssuer.MintZUSD` mints positive ZUSD grants and faucet receipts.
+- `ZUSDHolding.TransferZUSD` transfers owner holdings and creates change on partial transfers.
+- `ZUSDFaucetGrant` records sandbox faucet issuance.
+- `ZUSDFaucetConfig` models sandbox faucet enablement and limits for future governance.
+
+ZUSD is test infrastructure. The production USDCx provider remains separate and fail-closed.
+
 ---
 
 ## Token Instrument Model
@@ -266,14 +278,15 @@ This makes USDCx a configured settlement token for the current checkpoint while 
 
 ## Transfer Proof Model
 
-Zalary does not currently execute Canton Token Standard or USDCx transfers directly inside Daml.
+Zalary keeps token settlement outside the Daml payroll contracts. The backend is responsible for executing or observing the Canton Token Standard USDCx transfer, then submitting a completed transfer proof into the Zalary workflow.
 
-Instead, the expected integration model is:
+The integration model is:
 
-1. The backend initiates or observes the actual token transfer through the relevant token infrastructure.
-2. The backend receives or constructs a transfer proof.
-3. The backend submits the proof into the Zalary workflow as a `TokenTransferProof`.
-4. Zalary validates the proof fields before recording funding or settlement.
+1. The backend queries USDCx Token Standard holdings for the employer wallet.
+2. The backend discovers a TransferFactory through the Utility API registry endpoint and injects `choiceContext.choiceContextData` into the transfer choice argument.
+3. The backend submits the USDCx transfer only when the real factory/context/disclosure data is available.
+4. Completed transfers produce a `TokenTransferProof`; pending transfers remain pending and do not confirm payroll settlement.
+5. Zalary validates the proof fields before recording funding or settlement.
 
 A transfer proof contains:
 

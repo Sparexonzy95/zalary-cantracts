@@ -1,5 +1,24 @@
 .daml/
+__pycache__/
+*.py[cod]
 *.hi
 *.hie
 *.o
 zalary-code-snapshot-*.txt
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+backend/db.sqlite3
+
+# Local secrets and generated files
+.env
+backend/.env
+*.sqlite3
+backend/db.sqlite3
+__pycache__/
+*.pyc
+.daml/
+*snapshot*.txt
